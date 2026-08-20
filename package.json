@@ -1,0 +1,8 @@
+{
+  "name": "opencode-quota-retry",
+  "version": "1.0.0",
+  "description": "Intercept quota-exhausted 429 errors and inject precise retry-after-ms so opencode retries after the quota window resets",
+  "main": "quota-retry.ts",
+  "keywords": ["opencode", "plugin", "retry", "quota", "rate-limit", "429"],
+  "license": "MIT"
+}
