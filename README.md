@@ -8,15 +8,15 @@ opencode 1.18.12 起把重试次数上限固定为 5 次。智谱/火山 coding 
 
 ## 工作原理
 
-opencode 重试时按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指数退避。本插件拦截配置中 provider 的 429 响应，先读响应内容判定原因：
+opencode 重试时按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指数退避。本插件拦截配置中 provider 的 429 响应，先用判定正则 `quotaMatch` 读响应内容判断原因：
 
 - 配额耗尽（如智谱"已达到 5 小时的使用上限"、火山"exceeded the monthly usage quota"）→ 计算出"距限额重置还剩多久"，把结果写入 `retry-after-ms` 后交还给 opencode。opencode 按这个时间等待并显示原生重试状态条，第一次重试就落在限额重置之后
-- 其他原因（如并发限流"Requests are too frequent"）→ 不注入，原样交还 opencode 原生指数退避
+- 没匹配上（如并发限流"Requests are too frequent"）→ 不注入，原样交还 opencode 原生指数退避
 
-重置时间来源有两种：
+重置时刻的获取顺序（`quota` 决定第一来源）：
 
-- `quota: "zhipu"`：智谱配额查询接口，返回精确的重置时间戳
-- `quota: "body"`：从 429 响应正文提取时间戳（火山用这个）
+- `quota: "zhipu"`：智谱配额查询接口（精确）→ 失败回退 `resetExtract` 从正文提取
+- `quota: "body"`：只用 `resetExtract` 从 429 正文提取（火山用这个）
 
 ## 安装
 
