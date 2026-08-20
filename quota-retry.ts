@@ -17,16 +17,29 @@
 //   拦截 429 响应并按配额 API / body 时间戳计算精确等待, 注入 retry-after-ms。
 //   第一次重试即落在限额重置之后 → 5 次上限碰不到; TUI 显示原生重试状态条。
 //
+// 更新机制:
+//   opencode 对 git 插件只安装一次(缓存 ~/.cache/opencode/packages/), 之后不再拉取。
+//   本插件在每次 opencode 启动时自同步: 比对 GitHub master 的 HEAD, 有新提交则
+//   下载新文件覆盖缓存副本(写入 .sync-state.json 记录已同步的 sha)。
+//   同步发生在当前进程加载之后, 新代码在下一次 opencode 启动时生效
+//   (即: 发布新版本后重启两次)。syncEnabled: false 可关闭。
+//
 // 闭包边界(不改什么):
 //   - 不碰重试次数上限(插件够不到 Effect 调度层), 上游 issue:
 //     https://github.com/anomalyco/opencode/issues/43596
-//   - 并发类 429(配额 API 显示健康)只能注入 fallbackWaitMs 拉长间隔, 超窗仍会断
+//   - 非配额 429(并发限流等): 不注入, 原样交还 opencode 原生指数退避
 //   - 标题生成走 SDK 层 retries:2, 不读 retry-after-ms, 失败无害
 //   - 非 429 响应原样透传
+//   - 配额 API 只在"确认配额耗尽"的 429 时才调用, 且有 cache 兜底
 
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
+
+const REPO = "yangyaofei/opencode-quota-retry"
+const BRANCH = "master"
+const SYNC_FILES = ["quota-retry.ts", "package.json", "README.md"]
 
 type ProviderConfig = {
   id: string
@@ -40,6 +53,8 @@ type ProviderConfig = {
 type PluginConfig = {
   providers: ProviderConfig[]
   quotaCacheMs?: number
+  syncEnabled?: boolean
+  repo?: string
 }
 
 const DEFAULT_QUOTA_URL = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
@@ -151,22 +166,112 @@ function readApiKey(providerID: string): string | undefined {
   return undefined
 }
 
+// 从本次请求的 headers 里提取 Bearer token(实际使用的 key, 不依赖 auth.json)
+function matchBearer(v: string | null | undefined): string | undefined {
+  if (!v) return undefined
+  const m = v.match(/^Bearer\s+(.+)$/i)
+  return m ? m[1].trim() : undefined
+}
+
+function extractBearerFromInit(init?: Parameters<typeof fetch>[1]): string | undefined {
+  const headers = init?.headers
+  if (!headers) return undefined
+  if (typeof (headers as Headers).get === "function") {
+    return matchBearer((headers as Headers).get("authorization"))
+  }
+  if (Array.isArray(headers)) {
+    const pair = headers.find(([k]) => String(k).toLowerCase() === "authorization")
+    return pair ? matchBearer(String(pair[1])) : undefined
+  }
+  for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
+    if (String(k).toLowerCase() === "authorization") return matchBearer(String(v))
+  }
+  return undefined
+}
+
+// 判定 429 是否配额耗尽(而非并发限流等其他原因)
+function isQuotaExhausted(text: string): boolean {
+  return /AccountQuotaExceeded|usage quota|使用上限|限额将在|"code"\s*:\s*"1308"/i.test(text)
+}
+
+// 自同步: 比对 GitHub HEAD, 有新提交则覆盖缓存副本, 下次启动生效
+function pluginDir(): string | undefined {
+  try {
+    return path.dirname(fileURLToPath(import.meta.url))
+  } catch {
+    return undefined
+  }
+}
+
+function readSyncState(dir: string): { head?: string } {
+  try {
+    return JSON.parse(readFileSync(path.join(dir, ".sync-state.json"), "utf8"))
+  } catch {
+    return {}
+  }
+}
+
+function writeSyncState(dir: string, state: { head: string }) {
+  try {
+    writeFileSync(path.join(dir, ".sync-state.json"), JSON.stringify(state))
+  } catch {}
+}
+
+async function syncPlugin(repo: string): Promise<void> {
+  const dir = pluginDir()
+  if (!dir) return
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 8000)
+  try {
+    const headRes = await fetch(`https://api.github.com/repos/${repo}/commits/${BRANCH}`, {
+      signal: ctrl.signal,
+    })
+    if (!headRes.ok) return
+    const { sha } = (await headRes.json()) as { sha?: string }
+    if (!sha || readSyncState(dir).head === sha) return
+    for (const file of SYNC_FILES) {
+      const fRes = await fetch(`https://raw.githubusercontent.com/${repo}/${BRANCH}/${file}`, {
+        signal: ctrl.signal,
+      })
+      if (!fRes.ok) return
+      writeFileSync(path.join(dir, file), Buffer.from(await fRes.arrayBuffer()))
+    }
+    writeSyncState(dir, { head: sha })
+  } catch {
+    // 网络不可达: 静默跳过
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 function parseBodyResetMs(text: string): number {
   const m = text.match(/(\d{4}-\d{2}-\d{2})[\sT](\d{2}:\d{2}:\d{2})/)
   if (!m) return Number.NaN
   return Date.parse(`${m[1]}T${m[2]}+08:00`) - Date.now()
 }
 
-export default async function (input: { directory?: string }) {
+export default async function (input: { directory?: string; client?: any }) {
   const pluginConfig = loadConfig(input.directory ?? process.cwd())
+  if (pluginConfig.syncEnabled !== false) {
+    syncPlugin(pluginConfig.repo ?? REPO).catch(() => {})
+  }
   const quotaCacheMs = pluginConfig.quotaCacheMs ?? DEFAULT_QUOTA_CACHE_MS
-  const cache = new Map<string, { at: number; wait: number }>()
+  // 缓存绝对重置时刻(而非相对 wait), 使用时再算差值, 避免缓存值随时间过期
+  const cache = new Map<string, { at: number; resetAt: number }>()
+
+  const toastClient = input.client
+  const toast = (title: string, message: string, variant: "info" | "warning" = "info") => {
+    try {
+      toastClient?.toast?.show?.({ title, message, variant })
+    } catch {}
+  }
+  let lastPassthroughToast = 0
 
   async function getZhipuResetMs(p: ProviderConfig, apiKey: string): Promise<number> {
     const hit = cache.get(p.id)
-    if (hit && Date.now() - hit.at < quotaCacheMs) return hit.wait
+    if (hit && Date.now() - hit.at < quotaCacheMs) return hit.resetAt - Date.now()
     const quotaUrl = p.quotaUrl ?? DEFAULT_QUOTA_URL
-    const wait = await (async () => {
+    const resetAt = await (async () => {
       try {
         const res = await fetch(quotaUrl, { headers: { Authorization: `Bearer ${apiKey}` } })
         if (!res.ok) return Number.NaN
@@ -177,24 +282,34 @@ export default async function (input: { directory?: string }) {
         const exhausted = limits.filter((l) => (l.percentage ?? 0) >= 100 || (l.remaining ?? 1) <= 0)
         if (exhausted.length === 0) return Number.NaN
         const reset = Math.min(...exhausted.map((l) => l.nextResetTime ?? Infinity))
-        if (!Number.isFinite(reset)) return Number.NaN
-        return reset - Date.now()
+        return Number.isFinite(reset) ? reset : Number.NaN
       } catch {
         return Number.NaN
       }
     })()
-    cache.set(p.id, { at: Date.now(), wait })
-    return wait
+    cache.set(p.id, { at: Date.now(), resetAt })
+    return resetAt - Date.now()
   }
 
   function makeFetch(p: ProviderConfig) {
-    const apiKey = p.apiKey ?? readApiKey(p.id)
+    const configuredKey = p.apiKey
     const fallbackWaitMs = p.fallbackWaitMs ?? DEFAULT_FALLBACK_WAIT_MS
     const bufferMs = p.bufferMs ?? DEFAULT_BUFFER_MS
     return async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const res = await fetch(url, init)
       if (res.status !== 429) return res
       const text = await res.text()
+      const headers = Object.fromEntries(res.headers)
+      if (!isQuotaExhausted(text)) {
+        // 并发限流等其他原因的 429: 不注入, 原样交还 opencode 原生指数退避
+        if (Date.now() - lastPassthroughToast > 300_000) {
+          lastPassthroughToast = Date.now()
+          toast(`${p.id} 限流`, "429 非配额耗尽(如并发限流), 走 opencode 原生重试", "info")
+        }
+        return new Response(text, { status: res.status, statusText: res.statusText, headers })
+      }
+      // 确认配额耗尽: token 优先取请求头(实际使用的 key), 其次 config, 最后 auth.json
+      const apiKey = extractBearerFromInit(init) ?? configuredKey ?? readApiKey(p.id)
       let waitMs = Number.NaN
       if (p.quota === "zhipu") {
         if (apiKey) waitMs = await getZhipuResetMs(p, apiKey)
@@ -202,16 +317,21 @@ export default async function (input: { directory?: string }) {
       } else {
         waitMs = parseBodyResetMs(text)
       }
-      if (!Number.isFinite(waitMs) || waitMs <= 0) {
-        waitMs = fallbackWaitMs
-      } else {
+      if (Number.isFinite(waitMs) && waitMs > 0) {
         waitMs += bufferMs
+        const minutes = waitMs / 60_000
+        const waitText =
+          minutes >= 60 ? `约 ${Math.round(minutes / 60)} 小时` : minutes >= 1 ? `约 ${Math.round(minutes)} 分钟` : "不到 1 分钟"
+        toast(`${p.id} 配额耗尽`, `等待${waitText}后自动重试`, "warning")
+      } else {
+        // 已知配额耗尽但拿不到精确重置时间(API 失败且 body 无时间戳), 才用 fallback
+        waitMs = fallbackWaitMs
+        toast(`${p.id} 配额耗尽`, "重置时间未知, 按 fallbackWaitMs 重试", "warning")
       }
-      console.log(`[quota-retry] ${p.id}: 429 intercepted, injecting retry-after-ms=${Math.ceil(waitMs)}`)
       return new Response(text, {
         status: res.status,
         statusText: res.statusText,
-        headers: { ...Object.fromEntries(res.headers), "retry-after-ms": String(Math.ceil(waitMs)) },
+        headers: { ...headers, "retry-after-ms": String(Math.ceil(waitMs)) },
       })
     }
   }

@@ -8,7 +8,10 @@ opencode 1.18.12 起把重试次数上限固定为 5 次。智谱/火山 coding 
 
 ## 工作原理
 
-opencode 重试时按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指数退避。本插件拦截配置中 provider 的 429 响应，计算出"距限额重置还剩多久"，把结果写入 `retry-after-ms` 后交还给 opencode。opencode 按这个时间等待并显示原生重试状态条，第一次重试就落在限额重置之后。
+opencode 重试时按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指数退避。本插件拦截配置中 provider 的 429 响应，先读响应内容判定原因：
+
+- 配额耗尽（如智谱"已达到 5 小时的使用上限"、火山"exceeded the monthly usage quota"）→ 计算出"距限额重置还剩多久"，把结果写入 `retry-after-ms` 后交还给 opencode。opencode 按这个时间等待并显示原生重试状态条，第一次重试就落在限额重置之后
+- 其他原因（如并发限流"Requests are too frequent"）→ 不注入，原样交还 opencode 原生指数退避
 
 重置时间来源有两种：
 
@@ -56,14 +59,29 @@ opencode 重试时按响应头决定等待时间：`retry-after-ms` > `retry-aft
 | `id` | 是 | opencode 的 providerID，如 `zhipuai-coding-plan`、`volces-ark` |
 | `quota` | 是 | 重置时间来源：`zhipu`（配额查询接口，精确）或 `body`（解析 429 正文） |
 | `quotaUrl` | 否 | 配额查询接口地址，默认智谱官方地址 |
-| `apiKey` | 否 | 配额查询用的 key；不填则读 opencode 的 auth.json |
-| `fallbackWaitMs` | 否 | 拿不到重置时间时的等待（默认 30000）。并发限流（非配额耗尽）的 429 会走这里 |
+| `apiKey` | 否 | 配额查询用的 key。不填则优先取本次请求头的 Authorization，再读 opencode 的 auth.json |
+| `fallbackWaitMs` | 否 | 已确认配额耗尽但拿不到精确重置时间时的等待（默认 30000）。非配额 429 不注入，走 opencode 原生重试 |
 | `bufferMs` | 否 | 附加缓冲（默认 10000）。重置时刻附近服务端可能还没生效，多等几秒避免白白消耗一次重试 |
 | `quotaCacheMs` | 否 | 全局字段。配额查询结果缓存（默认 60000） |
 
-验证是否生效：配额耗尽时运行 opencode，日志出现 `[quota-retry] xxx: 429 intercepted, injecting retry-after-ms=...`，且会话进入长时间等待而不是 2/4/8/16/32 秒连发。
+验证是否生效：配额耗尽时运行 opencode，opencode 会弹出 toast 提示（"xxx 配额耗尽，等待约 N 小时后自动重试"），且会话进入长时间等待而不是 2/4/8/16/32 秒连发。
 
 修改配置后重启 opencode 生效。
+
+## 更新机制
+
+opencode 对 git 安装的插件只装一次（缓存在 `~/.cache/opencode/packages/`），之后不自动拉取。本插件在每次 opencode 启动时自同步：比对 GitHub 仓库最新提交，有新版本则下载覆盖缓存副本。
+
+同步发生在启动加载之后，因此新版本在下一次启动时生效：**发布新版本后需重启 opencode 两次**（第一次完成同步，第二次加载新代码）。
+
+可用配置关闭或改仓库：
+
+```jsonc
+{
+  "syncEnabled": false,                      // 默认 true
+  "repo": "yangyaofei/opencode-quota-retry"   // 默认值
+}
+```
 
 ## 限制
 
