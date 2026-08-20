@@ -78,9 +78,12 @@ opencode 重试时按响应头决定等待时间：`retry-after-ms` > `retry-aft
 
 ## 更新机制
 
-opencode 对 git 安装的插件只装一次（缓存在 `~/.cache/opencode/packages/`），之后不自动拉取。本插件在每次 opencode 启动时自同步：比对 GitHub 仓库最新提交，有新版本则下载覆盖缓存副本。
+opencode 对 git 安装的插件只装一次（缓存在 `~/.cache/opencode/packages/`），之后不自动拉取。本插件在每次 opencode 启动时用 `git ls-remote` 比对 GitHub 仓库最新提交（10 秒超时）：
 
-同步发生在启动加载之后，因此新版本在下一次启动时生效：**发布新版本后需重启 opencode 两次**（第一次完成同步，第二次加载新代码）。
+- 有新提交 → 删除本地缓存副本（连同钉住旧版本的 lock 文件）
+- 无新提交或网络不可达 → 不动
+
+opencode 重启时检测到缓存缺失会自动重新安装最新版，因此：**发布新版本后需重启 opencode 两次**（第一次完成同步删除，第二次加载新代码）。
 
 可用配置关闭或改仓库：
 

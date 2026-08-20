@@ -17,10 +17,12 @@
 //   拦截 429 响应并按配额 API / body 时间戳计算精确等待, 注入 retry-after-ms。
 //   第一次重试即落在限额重置之后 → 5 次上限碰不到; TUI 显示原生重试状态条。
 //
-// 更新机制:
+// 更新机制(借鉴 opencode-acp 的"删除+重装"思路):
 //   opencode 对 git 插件只安装一次(缓存 ~/.cache/opencode/packages/), 之后不再拉取。
-//   本插件在每次 opencode 启动时自同步: 比对 GitHub master 的 HEAD, 有新提交则
-//   下载新文件覆盖缓存副本(写入 .sync-state.json 记录已同步的 sha)。
+//   本插件每次启动时用 git ls-remote 比对 GitHub master 的 HEAD(10s 超时):
+//   - 有新提交: 删除自己的 wrapper 目录(含 package-lock, 钉死旧 commit 的元凶)。
+//     opencode 重启时检测到缺失会自动重新安装最新版。
+//   - 无新提交 / 网络不可达: 不动。
 //   同步发生在当前进程加载之后, 新代码在下一次 opencode 启动时生效
 //   (即: 发布新版本后重启两次)。syncEnabled: false 可关闭。
 //
@@ -32,14 +34,14 @@
 //   - 非 429 响应原样透传
 //   - 配额 API 只在"确认配额耗尽"的 429 时才调用, 且有 cache 兜底
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs"
+import { execFile } from "node:child_process"
+import { existsSync, readFileSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const REPO = "yangyaofei/opencode-quota-retry"
 const BRANCH = "master"
-const SYNC_FILES = ["quota-retry.ts", "package.json", "README.md"]
 
 type ProviderConfig = {
   id: string
@@ -195,7 +197,7 @@ function extractBearerFromInit(init?: Parameters<typeof fetch>[1]): string | und
   return undefined
 }
 
-// 自同步: 比对 GitHub HEAD, 有新提交则覆盖缓存副本, 下次启动生效
+// 自同步: 比对 GitHub HEAD, 有新提交则删除本地 wrapper, 重启后 opencode 重装最新版
 function pluginDir(): string | undefined {
   try {
     return path.dirname(fileURLToPath(import.meta.url))
@@ -204,44 +206,62 @@ function pluginDir(): string | undefined {
   }
 }
 
-function readSyncState(dir: string): { head?: string } {
+// wrapper 目录 = 插件目录的上级上级(形如 ~/.cache/opencode/packages/<spec>/),
+// 判定依据: 其 package.json 依赖里声明了插件名
+function wrapperDir(dir: string): string | undefined {
+  const name = path.basename(dir)
+  const parent = path.dirname(path.dirname(dir))
   try {
-    return JSON.parse(readFileSync(path.join(dir, ".sync-state.json"), "utf8"))
+    const pkg = JSON.parse(readFileSync(path.join(parent, "package.json"), "utf8"))
+    return pkg?.dependencies?.[name] ? parent : undefined
   } catch {
-    return {}
+    return undefined
   }
 }
 
-function writeSyncState(dir: string, state: { head: string }) {
+// 当前已安装版本: package-lock.json 的 resolved 字段里的 commit sha
+// (形如 git+ssh://...#dd4948213f60ab379ab523613852bc5f776e365b)
+function currentCommit(wrapper: string): string | undefined {
   try {
-    writeFileSync(path.join(dir, ".sync-state.json"), JSON.stringify(state))
+    const lock = JSON.parse(readFileSync(path.join(wrapper, "package-lock.json"), "utf8"))
+    for (const entry of Object.values(lock.packages ?? {})) {
+      const resolved = (entry as { resolved?: unknown })?.resolved
+      if (typeof resolved === "string") {
+        const m = resolved.match(/#([0-9a-f]{40})$/)
+        if (m) return m[1]
+      }
+    }
   } catch {}
+  return undefined
 }
 
-async function syncPlugin(repo: string): Promise<void> {
+function latestCommit(repo: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    execFile(
+      "git",
+      ["ls-remote", `https://github.com/${repo}.git`, BRANCH],
+      { timeout: 10_000 },
+      (err, stdout) => {
+        if (err) return resolve(undefined)
+        resolve(stdout.split(/\s+/)[0] || undefined)
+      },
+    )
+  })
+}
+
+async function syncPlugin(repo: string, notify: (title: string, message: string) => void): Promise<void> {
   const dir = pluginDir()
   if (!dir) return
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 8000)
+  const wrapper = wrapperDir(dir)
+  if (!wrapper) return
+  const cur = currentCommit(wrapper)
+  const latest = await latestCommit(repo)
+  if (!cur || !latest || cur === latest) return
   try {
-    const headRes = await fetch(`https://api.github.com/repos/${repo}/commits/${BRANCH}`, {
-      signal: ctrl.signal,
-    })
-    if (!headRes.ok) return
-    const { sha } = (await headRes.json()) as { sha?: string }
-    if (!sha || readSyncState(dir).head === sha) return
-    for (const file of SYNC_FILES) {
-      const fRes = await fetch(`https://raw.githubusercontent.com/${repo}/${BRANCH}/${file}`, {
-        signal: ctrl.signal,
-      })
-      if (!fRes.ok) return
-      writeFileSync(path.join(dir, file), Buffer.from(await fRes.arrayBuffer()))
-    }
-    writeSyncState(dir, { head: sha })
+    rmSync(wrapper, { recursive: true, force: true })
+    notify("quota-retry 已同步", "检测到新版本, 旧副本已删除, 重启 opencode 生效")
   } catch {
-    // 网络不可达: 静默跳过
-  } finally {
-    clearTimeout(timer)
+    // 删除失败: 静默, 下次启动再试
   }
 }
 
@@ -256,19 +276,19 @@ function parseExtractedTime(m: RegExpMatchArray | null): number {
 
 export default async function (input: { directory?: string; client?: any }) {
   const pluginConfig = loadConfig(input.directory ?? process.cwd())
+  const toastClient = input.client
+  const toast = (title: string, message: string, variant: "info" | "warning" = "info") => {
+    try {
+      toastClient?.tui?.showToast?.({ body: { title, message, variant, duration: 5000 } })
+    } catch {}
+  }
   if (pluginConfig.syncEnabled !== false) {
-    syncPlugin(pluginConfig.repo ?? REPO).catch(() => {})
+    syncPlugin(pluginConfig.repo ?? REPO, toast).catch(() => {})
   }
   const quotaCacheMs = pluginConfig.quotaCacheMs ?? DEFAULT_QUOTA_CACHE_MS
   // 缓存绝对重置时刻(而非相对 wait), 使用时再算差值, 避免缓存值随时间过期
   const cache = new Map<string, { at: number; resetAt: number }>()
 
-  const toastClient = input.client
-  const toast = (title: string, message: string, variant: "info" | "warning" = "info") => {
-    try {
-      toastClient?.toast?.show?.({ title, message, variant })
-    } catch {}
-  }
   let lastPassthroughToast = 0
 
   async function getZhipuResetMs(p: ProviderConfig, apiKey: string): Promise<number> {
