@@ -251,11 +251,15 @@ function latestCommit(repo: string): Promise<string | undefined> {
 
 async function syncPlugin(repo: string, notify: (title: string, message: string) => void): Promise<void> {
   const dir = pluginDir()
+  console.error("[quota-retry][sync] pluginDir:", dir)
   if (!dir) return
   const wrapper = wrapperDir(dir)
+  console.error("[quota-retry][sync] wrapper:", wrapper)
   if (!wrapper) return
   const cur = currentCommit(wrapper)
+  console.error("[quota-retry][sync] current:", cur)
   const latest = await latestCommit(repo)
+  console.error("[quota-retry][sync] latest:", latest)
   if (!cur || !latest || cur === latest) return
   try {
     rmSync(wrapper, { recursive: true, force: true })
