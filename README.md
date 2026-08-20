@@ -1,49 +1,23 @@
 # opencode-quota-retry
 
-opencode v1 插件：拦截配额类 429 错误，注入精确的 `retry-after-ms`，让 opencode 原生重试机制
-在限额重置后再重试，而不是 5 次指数退避（约 70 秒）后放弃。
+拦截配额类 429 错误，注入精确的重试等待时间（`retry-after-ms`），让 opencode 在限额重置后再重试，而不是 5 次指数退避（约 70 秒）后放弃。
 
-## 背景
+## 解决的问题
 
-opencode v1.18.12+（commit c789868，issue #41939）把 session stream 的重试上限钉死为 5 次
-（`packages/opencode/src/session/retry.ts: RETRY_MAX_RETRIES = 5`）。对"5 小时/月配额"类
-provider（智谱 coding plan、火山 coding plan），配额耗尽后 5 次重试只覆盖约 70 秒，会话直接
-中断——而错误信息本身说明配额几小时甚至几天后才重置。此前 opencode 会无限重试直到限额恢复。
+opencode 1.18.12 起把重试次数上限固定为 5 次。智谱/火山 coding plan 配额耗尽后，5 次重试只覆盖约 70 秒，会话直接中断——但错误信息里已经写明配额几小时后才重置。此前 opencode 会一直重试到限额恢复。
 
-## 原理
+## 工作原理
 
-`retry.ts` 的 `delay()` 按优先级决定每次重试的等待时长：
+opencode 重试时按响应头决定等待时间：`retry-after-ms` > `retry-after` > 指数退避。本插件拦截配置中 provider 的 429 响应，计算出"距限额重置还剩多久"，把结果写入 `retry-after-ms` 后交还给 opencode。opencode 按这个时间等待并显示原生重试状态条，第一次重试就落在限额重置之后。
 
-```
-1. error.data.responseHeaders["retry-after-ms"] 有值 → 按毫秒等待（优先）
-2. error.data.responseHeaders["retry-after"] 有值 → 按秒/HTTP-date 等待
-3. 都没有 → 指数退避（2s×2^n），有 headers 时无封顶，无 headers 封顶 30s
-```
+重置时间来源有两种：
 
-本插件通过 config hook 给目标 provider 注入自定义 `fetch`（`provider.options.fetch`，
-经 `LLMRequestPrep` → `prepareOptions` 被 AI SDK 使用）。拦截 429 响应：
-
-```
-是 429？
-├─ quota="zhipu": 调配额 API (api/monitor/usage/quota/limit) 取已耗尽限额的
-│                 nextResetTime（epoch ms）→ wait = reset - now
-│                 （实测: TOKENS_LIMIT.percentage=100 的 nextResetTime 与 429 message
-│                   里的重置时刻分秒不差）
-│                 API 失败时回退解析 429 body 时间戳
-├─ quota="body":  解析 429 body 时间戳
-│                 （火山: "It will reset at 2026-08-21 23:59:59 +0800 CST"）
-└─ 拿不到 → 注入 fallbackWaitMs（默认 30s，并发类 429 靠它拉长重试间隔）
-→ 等待时长再附加 bufferMs（默认 10s，吸收服务端时钟与重置生效的边界偏差，
-  避免重试恰好卡在重置时刻白白消耗一次重试）
-→ 重建 Response，注入 retry-after-ms: ceil(wait)
-```
-
-效果：主 stream 的第一次重试就落在限额重置之后 → 5 次上限碰不到；TUI 显示原生重试状态条
-（retrying in Xh），用户可随时中断。
+- `quota: "zhipu"`：智谱配额查询接口，返回精确的重置时间戳
+- `quota: "body"`：从 429 响应正文提取时间戳（火山用这个）
 
 ## 安装
 
-opencode.jsonc：
+`opencode.jsonc`：
 
 ```jsonc
 "plugin": [
@@ -51,45 +25,48 @@ opencode.jsonc：
 ]
 ```
 
-配置文件（全局 `~/.config/opencode/quota-retry.jsonc`，或项目 `.opencode/quota-retry.jsonc`，
-项目优先）：
+## 配置
+
+配置文件放在全局 `~/.config/opencode/quota-retry.jsonc` 或项目的 `.opencode/quota-retry.jsonc`（项目优先）。一个 provider 一条配置：
 
 ```jsonc
 {
   "providers": [
     {
-      "id": "zhipuai-coding-plan",   // opencode 的 providerID
-      "quota": "zhipu",              // zhipu=调配额 API 精确重置时间; body=解析 429 body
-      "quotaUrl": "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
-      // "apiKey": "",               // 可选, 不填则读 ~/.local/share/opencode/auth.json
-      "fallbackWaitMs": 30000,       // 拿不到重置时间时的回退等待(并发类 429), ms
-      "bufferMs": 10000              // 附加缓冲(服务端时钟/重置生效偏差), ms, 默认 10000
+      "id": "zhipuai-coding-plan",   // opencode 里的 providerID
+      "quota": "zhipu",              // 重置时间来源: zhipu 或 body
+      "fallbackWaitMs": 30000,       // 拿不到重置时间时每次重试等多久(毫秒)
+      "bufferMs": 10000              // 在计算出的等待上额外加的缓冲(毫秒)
     },
     {
       "id": "volces-ark",
       "quota": "body",
-      "fallbackWaitMs": 30000
+      "fallbackWaitMs": 30000,
+      "bufferMs": 10000
     }
   ],
-  "quotaCacheMs": 60000              // 配额 API 结果缓存, ms
+  "quotaCacheMs": 60000              // 配额查询结果缓存时长(毫秒)
 }
 ```
 
-改动配置后需重启 opencode（插件在启动时读取一次）。
+字段说明：
 
-## 边界
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `id` | 是 | opencode 的 providerID，如 `zhipuai-coding-plan`、`volces-ark` |
+| `quota` | 是 | 重置时间来源：`zhipu`（配额查询接口，精确）或 `body`（解析 429 正文） |
+| `quotaUrl` | 否 | 配额查询接口地址，默认智谱官方地址 |
+| `apiKey` | 否 | 配额查询用的 key；不填则读 opencode 的 auth.json |
+| `fallbackWaitMs` | 否 | 拿不到重置时间时的等待（默认 30000）。并发限流（非配额耗尽）的 429 会走这里 |
+| `bufferMs` | 否 | 附加缓冲（默认 10000）。重置时刻附近服务端可能还没生效，多等几秒避免白白消耗一次重试 |
+| `quotaCacheMs` | 否 | 全局字段。配额查询结果缓存（默认 60000） |
 
-- **5 次重试上限本身插件无法移除**（插件够不到 Effect 调度层）。并发 429 持续超过
-  `5 × fallbackWaitMs` 仍会断。上限可配置化见上游 issue:
-  https://github.com/anomalyco/opencode/issues/43596
-- 标题生成走 SDK 层 retries:2（不读 retry-after-ms），失败无害
-- 非 429 响应原样透传；未配置的 provider 不受影响
+验证是否生效：配额耗尽时运行 opencode，日志出现 `[quota-retry] xxx: 429 intercepted, injecting retry-after-ms=...`，且会话进入长时间等待而不是 2/4/8/16/32 秒连发。
 
-## 实测验证（2026-08-20，opencode 1.18.18）
+修改配置后重启 opencode 生效。
 
-- **火山**（月配额耗尽）：`[quota-retry] volces-ark: 429 intercepted, injecting retry-after-ms=111007764`
-  （30.8 小时），主 stream 一次错误后静默等待至重置时刻；对照组（无插件）2/4/8/16/32s 连发
-  5 次后 72s 中断
-- **智谱**（5 小时窗口耗尽）：注入 `retry-after-ms=8571808`（2.38 小时），与配额 API 的
-  `TOKENS_LIMIT.nextResetTime=2026-08-20 19:42:37` 及 429 message 完全一致
-- 配额 API 缓存生效：同一窗口内 4 次注入值完全相同
+## 限制
+
+- 重试次数上限（5 次）插件无法修改。并发限流持续超过 5 × fallbackWaitMs 仍会中断。相关 issue：<https://github.com/anomalyco/opencode/issues/43596>
+- 标题生成的重试不走这条路径，标题失败不影响正文
+- 未配置的 provider 不受影响
