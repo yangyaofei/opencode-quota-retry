@@ -259,10 +259,9 @@ async function syncPlugin(repo: string, notify: (title: string, message: string)
   if (!cur || !latest || cur === latest) return
   try {
     rmSync(wrapper, { recursive: true, force: true })
-    console.error("[quota-retry][sync] rmSync OK:", wrapper)
     notify("quota-retry 已同步", "检测到新版本, 旧副本已删除, 重启 opencode 生效")
-  } catch (e) {
-    console.error("[quota-retry][sync] rmSync FAILED:", (e as Error)?.message)
+  } catch {
+    // 删除失败: 静默, 下次启动再试
   }
 }
 
