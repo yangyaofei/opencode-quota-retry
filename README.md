@@ -33,6 +33,8 @@ provider（智谱 coding plan、火山 coding plan），配额耗尽后 5 次重
 ├─ quota="body":  解析 429 body 时间戳
 │                 （火山: "It will reset at 2026-08-21 23:59:59 +0800 CST"）
 └─ 拿不到 → 注入 fallbackWaitMs（默认 30s，并发类 429 靠它拉长重试间隔）
+→ 等待时长再附加 bufferMs（默认 10s，吸收服务端时钟与重置生效的边界偏差，
+  避免重试恰好卡在重置时刻白白消耗一次重试）
 → 重建 Response，注入 retry-after-ms: ceil(wait)
 ```
 
@@ -60,7 +62,8 @@ opencode.jsonc：
       "quota": "zhipu",              // zhipu=调配额 API 精确重置时间; body=解析 429 body
       "quotaUrl": "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
       // "apiKey": "",               // 可选, 不填则读 ~/.local/share/opencode/auth.json
-      "fallbackWaitMs": 30000        // 拿不到重置时间时的回退等待(并发类 429), ms
+      "fallbackWaitMs": 30000,       // 拿不到重置时间时的回退等待(并发类 429), ms
+      "bufferMs": 10000              // 附加缓冲(服务端时钟/重置生效偏差), ms, 默认 10000
     },
     {
       "id": "volces-ark",

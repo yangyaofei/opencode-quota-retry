@@ -33,6 +33,7 @@ type ProviderConfig = {
   quota: "zhipu" | "body"
   quotaUrl?: string
   fallbackWaitMs?: number
+  bufferMs?: number
   apiKey?: string
 }
 
@@ -44,6 +45,7 @@ type PluginConfig = {
 const DEFAULT_QUOTA_URL = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
 const DEFAULT_FALLBACK_WAIT_MS = 30_000
 const DEFAULT_QUOTA_CACHE_MS = 60_000
+const DEFAULT_BUFFER_MS = 10_000
 
 function configDir(): string {
   return process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config")
@@ -188,6 +190,7 @@ export default async function (input: { directory?: string }) {
   function makeFetch(p: ProviderConfig) {
     const apiKey = p.apiKey ?? readApiKey(p.id)
     const fallbackWaitMs = p.fallbackWaitMs ?? DEFAULT_FALLBACK_WAIT_MS
+    const bufferMs = p.bufferMs ?? DEFAULT_BUFFER_MS
     return async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const res = await fetch(url, init)
       if (res.status !== 429) return res
@@ -199,7 +202,11 @@ export default async function (input: { directory?: string }) {
       } else {
         waitMs = parseBodyResetMs(text)
       }
-      if (!Number.isFinite(waitMs) || waitMs <= 0) waitMs = fallbackWaitMs
+      if (!Number.isFinite(waitMs) || waitMs <= 0) {
+        waitMs = fallbackWaitMs
+      } else {
+        waitMs += bufferMs
+      }
       console.log(`[quota-retry] ${p.id}: 429 intercepted, injecting retry-after-ms=${Math.ceil(waitMs)}`)
       return new Response(text, {
         status: res.status,
