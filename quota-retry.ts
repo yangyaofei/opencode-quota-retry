@@ -45,6 +45,8 @@ type ProviderConfig = {
   id: string
   quota: "zhipu" | "body"
   quotaUrl?: string
+  quotaMatch?: string
+  resetExtract?: string
   fallbackWaitMs?: number
   bufferMs?: number
   apiKey?: string
@@ -61,6 +63,10 @@ const DEFAULT_QUOTA_URL = "https://open.bigmodel.cn/api/monitor/usage/quota/limi
 const DEFAULT_FALLBACK_WAIT_MS = 30_000
 const DEFAULT_QUOTA_CACHE_MS = 60_000
 const DEFAULT_BUFFER_MS = 10_000
+// 判定 429 是不是配额耗尽的默认正则(智谱+火山特征)
+const DEFAULT_QUOTA_MATCH = 'AccountQuotaExceeded|usage quota|使用上限|限额将在|"code"\\s*:\\s*"1308"'
+// 从 body 提取重置时间的默认正则(捕获组 1 = 完整时间串)
+const DEFAULT_RESET_EXTRACT = "((?:\\d{4}-\\d{2}-\\d{2})[\\sT]\\d{2}:\\d{2}:\\d{2})"
 
 function configDir(): string {
   return process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config")
@@ -189,11 +195,6 @@ function extractBearerFromInit(init?: Parameters<typeof fetch>[1]): string | und
   return undefined
 }
 
-// 判定 429 是否配额耗尽(而非并发限流等其他原因)
-function isQuotaExhausted(text: string): boolean {
-  return /AccountQuotaExceeded|usage quota|使用上限|限额将在|"code"\s*:\s*"1308"/i.test(text)
-}
-
 // 自同步: 比对 GitHub HEAD, 有新提交则覆盖缓存副本, 下次启动生效
 function pluginDir(): string | undefined {
   try {
@@ -244,10 +245,13 @@ async function syncPlugin(repo: string): Promise<void> {
   }
 }
 
-function parseBodyResetMs(text: string): number {
-  const m = text.match(/(\d{4}-\d{2}-\d{2})[\sT](\d{2}:\d{2}:\d{2})/)
-  if (!m) return Number.NaN
-  return Date.parse(`${m[1]}T${m[2]}+08:00`) - Date.now()
+// 从 429 body 提取重置时刻(捕获组 1 = 完整时间串); 无时区后缀按 +08:00 解析。
+// 返回绝对毫秒时间戳, 解析失败返回 NaN
+function parseExtractedTime(m: RegExpMatchArray | null): number {
+  const s = m?.[1]
+  if (!s) return Number.NaN
+  const base = /(Z|[+-]\d{2}:?\d{2})$/.test(s) ? s : `${s.replace(" ", "T")}+08:00`
+  return Date.parse(base)
 }
 
 export default async function (input: { directory?: string; client?: any }) {
@@ -295,13 +299,17 @@ export default async function (input: { directory?: string; client?: any }) {
     const configuredKey = p.apiKey
     const fallbackWaitMs = p.fallbackWaitMs ?? DEFAULT_FALLBACK_WAIT_MS
     const bufferMs = p.bufferMs ?? DEFAULT_BUFFER_MS
+    // 两组正则: quotaMatch 判定是不是配额 429; resetExtract 提取重置时刻
+    const quotaMatch = new RegExp(p.quotaMatch ?? DEFAULT_QUOTA_MATCH, "i")
+    const resetExtract = p.resetExtract ? new RegExp(p.resetExtract, "i") : new RegExp(DEFAULT_RESET_EXTRACT, "i")
+    const extractFromBody = (text: string): number => parseExtractedTime(text.match(resetExtract)) - Date.now()
     return async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const res = await fetch(url, init)
       if (res.status !== 429) return res
       const text = await res.text()
       const headers = Object.fromEntries(res.headers)
-      if (!isQuotaExhausted(text)) {
-        // 并发限流等其他原因的 429: 不注入, 原样交还 opencode 原生指数退避
+      if (!quotaMatch.test(text)) {
+        // 没匹配上配额特征: 不注入, 原样交还 opencode 原生指数退避
         if (Date.now() - lastPassthroughToast > 300_000) {
           lastPassthroughToast = Date.now()
           toast(`${p.id} 限流`, "429 非配额耗尽(如并发限流), 走 opencode 原生重试", "info")
@@ -313,9 +321,9 @@ export default async function (input: { directory?: string; client?: any }) {
       let waitMs = Number.NaN
       if (p.quota === "zhipu") {
         if (apiKey) waitMs = await getZhipuResetMs(p, apiKey)
-        if (Number.isNaN(waitMs)) waitMs = parseBodyResetMs(text)
+        if (Number.isNaN(waitMs)) waitMs = extractFromBody(text)
       } else {
-        waitMs = parseBodyResetMs(text)
+        waitMs = extractFromBody(text)
       }
       if (Number.isFinite(waitMs) && waitMs > 0) {
         waitMs += bufferMs

@@ -44,6 +44,10 @@ opencode 重试时按响应头决定等待时间：`retry-after-ms` > `retry-aft
     {
       "id": "volces-ark",
       "quota": "body",
+      // 判定 429 是不是配额耗尽(不匹配则透传, 走 opencode 原生重试)
+      "quotaMatch": "AccountQuotaExceeded|exceeded the .*usage quota",
+      // 从 429 正文提取重置时刻, 捕获组 1 = 完整时间串
+      "resetExtract": "reset at\\s+((?:\\d{4}-\\d{2}-\\d{2})\\s+\\d{2}:\\d{2}:\\d{2})",
       "fallbackWaitMs": 30000,
       "bufferMs": 10000
     }
@@ -52,12 +56,16 @@ opencode 重试时按响应头决定等待时间：`retry-after-ms` > `retry-aft
 }
 ```
 
+两组正则适配任何类似行为的 provider：`quotaMatch` 判定这个 429 是不是配额耗尽，`resetExtract` 从正文里拿下次重置时刻。两者均有内置默认值，不配也支持智谱和火山。
+
 字段说明：
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `id` | 是 | opencode 的 providerID，如 `zhipuai-coding-plan`、`volces-ark` |
-| `quota` | 是 | 重置时间来源：`zhipu`（配额查询接口，精确）或 `body`（解析 429 正文） |
+| `quota` | 是 | 重置时刻来源：`zhipu`（配额查询接口，失败时回退 `resetExtract`）或 `body`（只用 `resetExtract`） |
+| `quotaMatch` | 否 | 判定 429 是不是配额耗尽的正则。不匹配的 429 不注入，走 opencode 原生重试 |
+| `resetExtract` | 否 | 从 429 正文提取重置时刻的正则，捕获组 1 = 完整时间串（如 `2026-08-21 23:59:59`）。无时区后缀按 +08:00 解析 |
 | `quotaUrl` | 否 | 配额查询接口地址，默认智谱官方地址 |
 | `apiKey` | 否 | 配额查询用的 key。不填则优先取本次请求头的 Authorization，再读 opencode 的 auth.json |
 | `fallbackWaitMs` | 否 | 已确认配额耗尽但拿不到精确重置时间时的等待（默认 30000）。非配额 429 不注入，走 opencode 原生重试 |
