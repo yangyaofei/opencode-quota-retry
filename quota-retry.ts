@@ -468,7 +468,7 @@ function findBackoffSite(buf: Buffer, chain: RetryChain): BackoffSite | undefine
   const m = seg.match(BACKOFF_RETURN_RE)
   if (!m) return undefined
   // 只替换开头的 return XX(YY(a,b)) 部分, }} 保留(否则块结构被破坏)
-  const head = m[0].match(/^return [a-z_$]{1,3}\([a-z_$]{1,3}\([a-z_$]{1,3},[a-z_$]{1,3}\)\)/)!
+  const head = m[0].match(/^return [a-z_$]{1,3}\([a-z_$]{1,3}\([a-z_$]{1,3},[a-z_$]{1,3}\)\)/)![0]
   return { at: chain.spanStart + chain.span.length + m.index!, from: head }
 }
 
