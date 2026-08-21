@@ -293,7 +293,11 @@ async function syncPlugin(repo: string, notify: (title: string, message: string)
   if (!cur || !latest || cur === latest) return
   try {
     rmSync(wrapper, { recursive: true, force: true })
-    notify("quota-retry 已同步", "检测到新版本, 旧副本已删除, 重启 opencode 生效")
+    // toast 必须延迟(同 opencode-acp update.ts): 此刻仍在 opencode bootstrap 期,
+    // TUI 尚未挂载完成, 立即发的 toast 会直接丢失
+    setTimeout(() => {
+      notify("quota-retry 已同步", "检测到新版本, 旧副本已删除, 重启 opencode 生效")
+    }, 5000)
   } catch {
     // 删除失败: 静默, 下次启动再试
   }
