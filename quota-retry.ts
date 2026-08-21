@@ -235,11 +235,26 @@ function currentCommit(wrapper: string): string | undefined {
   return undefined
 }
 
-function latestCommit(repo: string): Promise<string | undefined> {
+// 安装 spec 里的 ref(分支名): wrapper 的依赖声明形如
+//   "opencode-quota-retry": "github:owner/repo#patch-max-retries"
+// 无 # 时默认 master。同步按此 ref 比对, 分支安装时同步也对分支生效
+function specRef(wrapper: string, name: string): string {
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(wrapper, "package.json"), "utf8"))
+    const dep = pkg?.dependencies?.[name]
+    if (typeof dep === "string") {
+      const m = dep.match(/#([^#]+)$/)
+      if (m && !/^[0-9a-f]{40}$/.test(m[1])) return m[1]
+    }
+  } catch {}
+  return BRANCH
+}
+
+function latestCommit(repo: string, ref: string): Promise<string | undefined> {
   return new Promise((resolve) => {
     execFile(
       "git",
-      ["ls-remote", `https://github.com/${repo}.git`, BRANCH],
+      ["ls-remote", `https://github.com/${repo}.git`, `refs/heads/${ref}`],
       { timeout: 10_000 },
       (err, stdout) => {
         if (err) return resolve(undefined)
@@ -255,7 +270,7 @@ async function syncPlugin(repo: string, notify: (title: string, message: string)
   const wrapper = wrapperDir(dir)
   if (!wrapper) return
   const cur = currentCommit(wrapper)
-  const latest = await latestCommit(repo)
+  const latest = await latestCommit(repo, specRef(wrapper, path.basename(dir)))
   if (!cur || !latest || cur === latest) return
   try {
     rmSync(wrapper, { recursive: true, force: true })
