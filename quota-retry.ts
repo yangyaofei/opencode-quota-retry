@@ -939,7 +939,8 @@ async function quotaRetryPlugin(input: { directory?: string; client?: any }) {
 
   return {
     config: (cfg: any) => {
-      // /retry-setting 命令: 模板只做呈现, 读数归 quota_retry_status 工具(确定性工作不过模型)
+      // /retry-setting 命令: 实际由 command.execute.before 本地处理(零模型调用);
+      // 模板仅作兜底(老版本 opencode 无该 hook 时, 走工具 + 模型呈现)
       cfg.command = cfg.command ?? {}
       cfg.command["retry-setting"] = {
         description: "查看 quota-retry 重试配置与二进制补丁的实际生效状态",
@@ -956,6 +957,24 @@ async function quotaRetryPlugin(input: { directory?: string; client?: any }) {
           options: { ...(existing.options ?? {}), fetch: makeFetch(p) },
         }
       }
+    },
+    // 零模型路径(同 opencode-acp /acp): 本地生成报告 → 写入 ignored 消息
+    // (noReply, 进对话记录可回看, 不触发模型回复) → 抛错中断命令的模型轮次
+    "command.execute.before": async (input: { command: string; sessionID?: string }, _output: unknown) => {
+      if (input.command !== "retry-setting") return
+      let text: string
+      try {
+        text = patchStatusReport(projectDir)
+      } catch (e) {
+        text = `[quota-retry] 状态读取失败: ${(e as Error).message}`
+      }
+      try {
+        await toastClient?.session?.prompt?.({
+          path: { id: input.sessionID },
+          body: { noReply: true, parts: [{ type: "text", text, ignored: true }] },
+        })
+      } catch {}
+      throw new Error("__QUOTA_RETRY_HANDLED__")
     },
     tool: {
       quota_retry_status: {
