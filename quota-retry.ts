@@ -837,7 +837,7 @@ function parseExtractedTime(m: RegExpMatchArray | null): number {
   return Date.parse(base)
 }
 
-export default async function (input: { directory?: string; client?: any }) {
+async function quotaRetryPlugin(input: { directory?: string; client?: any }) {
   const projectDir = input.directory ?? process.cwd()
   const pluginConfig = loadConfig(projectDir)
   const toastClient = input.client
@@ -967,7 +967,9 @@ export default async function (input: { directory?: string; client?: any }) {
   }
 }
 
-// 注意: opencode 把模块里任何"函数型导出"都当作插件候选逐一调用。
-// 测试用的内部函数必须挂在对象下导出(非函数), 否则插件加载直接失败
-// (曾因 export { patchStatusReport } 导致 "paths[0] must be string, got object")
-export const __internals = { patchStatusReport }
+// 测试钩子挂在默认导出函数的属性上: opencode 要求模块的所有导出均为插件函数,
+// 多余的具名导出(无论函数还是对象)都会导致加载失败
+// (曾因 export { patchStatusReport } 报 paths[0] 类型错误, 对象导出报 not a function)
+;(quotaRetryPlugin as any).__internals = { patchStatusReport }
+
+export default quotaRetryPlugin
