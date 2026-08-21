@@ -148,14 +148,12 @@ master 的注入方案解决了配额场景的"等多久"，但两个问题够�
 
 ### 查询当前生效状态
 
-opencode 里输入 `/retry-setting`（本分支），输出：
-
-- 实际使用的配置文件路径（项目 `.opencode/quota-retry.jsonc` 优先于全局）
+opencode 里输入 `/retry-setting`（本分支），输出：- 实际使用的配置文件路径（项目 `.opencode/quota-retry.jsonc` 优先于全局）
 - providers 与 patch 配置内容、入口校验结果
 - 每份 opencode 二进制重试参数的**实际值**（无限重试 / 次数上限 / 退避封顶），与配置期望逐项对照，标出哪些值已写入、哪些未写入（未写入的下次启动自动改写）
 - 状态缓存是否命中（下次启动是否跳过检查）
 
-只读查询，不改任何文件。读数由插件注册的 `quota_retry_status` 工具完成（确定性工作不过模型），命令只负责呈现。
+只读查询，不改任何文件，**不调用模型**（与 opencode-acp `/acp` 同款机制）：命令被 `command.execute.before` 钩子本地接管，报告以 `noReply + ignored` 消息写进对话记录（可回看、不触发模型回复），随后中断命令的模型轮次。报告内容同时注册为 `quota_retry_status` 工具，在会话里直接问也可获取。
 
 ### 如何生效
 
