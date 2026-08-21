@@ -39,10 +39,12 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs"
 import { homedir } from "node:os"
@@ -518,54 +520,118 @@ function restoreBinary(bin: string): boolean {
   return true
 }
 
+// ===== 补丁状态缓存 =====
+// 每次启动对 3 份 ~184MB 二进制做 readFileSync+全量扫描代价高(首次实测拖慢启动)。
+// 补丁是 (二进制内容, 配置) 的确定函数, 用 size+mtimeMs+目标 描述"已做过什么",
+// 命中即跳过读盘与写入; npm 升级换文件/配置变更 → stat 变化 → 自动失效重做。
+type PatchStateEntry = { size: number; mtimeMs: number; want: string }
+
+function patchStateFile(): string {
+  return path.join(homedir(), ".cache", "opencode", "quota-retry-patch-state.json")
+}
+
+function loadPatchState(): Record<string, PatchStateEntry> {
+  try {
+    const parsed = JSON.parse(readFileSync(patchStateFile(), "utf8"))
+    return parsed && typeof parsed === "object" ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function savePatchState(state: Record<string, PatchStateEntry>) {
+  try {
+    mkdirSync(path.dirname(patchStateFile()), { recursive: true })
+    writeFileSync(patchStateFile(), JSON.stringify(state, null, 2))
+  } catch {}
+}
+
+function binStat(bin: string): { size: number; mtimeMs: number } | undefined {
+  try {
+    const st = statSync(bin)
+    return { size: st.size, mtimeMs: st.mtimeMs }
+  } catch {
+    return undefined
+  }
+}
+
 function runPatch(cfg: PatchConfig, notify: (title: string, message: string, variant?: "info" | "warning") => void) {
-  if (cfg.restore) {
-    let n = 0
-    for (const bin of opencodeBinaries()) {
-      try {
-        if (restoreBinary(bin)) n++
-      } catch {}
-    }
-    notify("quota-retry 补丁", n > 0 ? `已还原 ${n} 个二进制(来自 .retry-bak)` : "未找到备份, 无需还原")
-    return
-  }
+  const restore = cfg.restore === true
   const maxRetries = cfg.maxRetries ?? -1
-  if (maxRetries !== -1 && !(maxRetries >= 1 && maxRetries <= 999)) {
-    notify("quota-retry 补丁", "maxRetries 仅支持 -1(无限) 或 1-999", "warning")
-    return
-  }
   const cap = cfg.backoffCapMs
-  if (cap !== undefined && !(cap >= 10_000 && cap <= 999_999)) {
-    notify("quota-retry 补丁", "backoffCapMs 仅支持 10000-999999 (10s 到 16.6 分钟)", "warning")
-    return
+
+  // 入口校验: 范围 + 等长替换位预算组合, 无效即 toast 并整体跳过
+  if (!restore) {
+    if (maxRetries !== -1 && !(Number.isInteger(maxRetries) && maxRetries >= 1 && maxRetries <= 99)) {
+      notify("quota-retry 补丁", "maxRetries 仅支持 -1(无限) 或 1-99", "warning")
+      return
+    }
+    if (cap !== undefined && !(Number.isInteger(cap) && cap >= 10_000 && cap <= 999_999)) {
+      notify("quota-retry 补丁", "backoffCapMs 仅支持 10000-999999 (10s 到 16.6 分钟)", "warning")
+      return
+    }
+    if (cap !== undefined && cap >= 100_000 && maxRetries >= 10 && maxRetries !== -1) {
+      notify("quota-retry 补丁", "backoffCapMs ≥ 100s(6 位数)时 maxRetries 仅支持 -1 或 1-9 (等长替换位预算)", "warning")
+      return
+    }
   }
+
+  const want = restore ? "restore" : `maxRetries=${maxRetries},cap=${cap ?? "-"}`
   const label = [
     `重试上限 ${maxRetries === -1 ? "无限" : maxRetries}`,
     cap ? `退避封顶 ${cap / 1000}s` : "",
   ]
     .filter(Boolean)
     .join(", ")
-  for (const bin of opencodeBinaries()) {
+
+  const bins = opencodeBinaries()
+  const state = loadPatchState()
+  let changed = false
+  for (const bin of bins) {
+    const st = binStat(bin)
+    if (!st) continue
+    // 幂等跳过: 同二进制同目标 → 不读盘不写入不 toast
+    const hit = state[bin]
+    if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs && hit.want === want) continue
+
+    let ok = false
     try {
-      const r = patchBinary(bin, { maxRetries, backoffCapMs: cap })
-      if (r === "patched") notify("quota-retry 补丁", `${label} 已写入 (${path.basename(bin)}), 下次启动生效`)
-      else if (r === "already") notify("quota-retry 补丁", `已是目标状态, 跳过 (${path.basename(bin)})`)
-      else if (r === "conflict")
-        notify("quota-retry 补丁", `当前为无限补丁, 改指定次数请先 restore (${path.basename(bin)})`, "warning")
-      else if (r === "invalid")
-        notify(
-          "quota-retry 补丁",
-          `位数装不下: 退避封顶(6 位数)与重试次数(2-3 位数)不能同时设置, 请二选一调小 (${path.basename(bin)})`,
-          "warning",
-        )
-      else notify("quota-retry 补丁", `未找到重试常量链, opencode 版本可能已大改, 跳过 (${path.basename(bin)})`, "warning")
+      if (restore) {
+        const r = restoreBinary(bin)
+        if (r) notify("quota-retry 补丁", `已还原出厂 (${path.basename(bin)})`)
+        ok = true
+      } else {
+        const r = patchBinary(bin, { maxRetries, backoffCapMs: cap })
+        if (r === "patched") notify("quota-retry 补丁", `${label} 已写入 (${path.basename(bin)}), 下次启动生效`)
+        else if (r === "conflict")
+          notify("quota-retry 补丁", `当前为无限补丁, 改指定次数请先 restore (${path.basename(bin)})`, "warning")
+        else if (r === "invalid")
+          notify("quota-retry 补丁", `位数装不下: 封顶与次数组合超出等长预算 (${path.basename(bin)})`, "warning")
+        else if (r === "notfound")
+          notify("quota-retry 补丁", `未找到重试常量链, opencode 版本可能已大改, 跳过 (${path.basename(bin)})`, "warning")
+        // "already" 静默: 状态文件缺失但二进制已是目标, 记入状态即可
+        ok = r === "patched" || r === "already"
+      }
     } catch (e) {
       const msg = (e as Error).message.includes("codesign")
-        ? `补丁已写入但重签名失败, macOS 下可能无法启动, 请手动执行 codesign -f -s -`
+        ? `补丁已写入但重签名失败, 请手动执行 codesign -f -s -`
         : `写入失败: ${(e as Error).message}`
       notify("quota-retry 补丁", `${msg} (${path.basename(bin)})`, "warning")
     }
+    if (ok) {
+      const after = binStat(bin) ?? st
+      state[bin] = { ...after, want }
+      changed = true
+    }
   }
+  // 清理已消失的二进制(如 npm 卸载平台包)
+  for (const k of Object.keys(state)) {
+    if (!bins.includes(k)) {
+      delete state[k]
+      changed = true
+    }
+  }
+  if (changed) savePatchState(state)
 }
 
 // 从 429 body 提取重置时刻(捕获组 1 = 完整时间串); 无时区后缀按 +08:00 解析。
@@ -589,8 +655,14 @@ export default async function (input: { directory?: string; client?: any }) {
     syncPlugin(pluginConfig.repo ?? REPO, toast).catch(() => {})
   }
   const patch = pluginConfig.patch
-  if (patch?.restore) runPatch({ restore: true }, toast)
-  else if (patch?.enabled) runPatch(patch, toast)
+  if (patch?.restore || patch?.enabled) {
+    // 补丁读写量大(3×184MB), 延迟到事件循环空闲时执行, 不阻塞 opencode 启动
+    setImmediate(() => {
+      try {
+        runPatch(patch, toast)
+      } catch {}
+    })
+  }
   const quotaCacheMs = pluginConfig.quotaCacheMs ?? DEFAULT_QUOTA_CACHE_MS
   // 缓存绝对重置时刻(而非相对 wait), 使用时再算差值, 避免缓存值随时间过期
   const cache = new Map<string, { at: number; resetAt: number }>()
