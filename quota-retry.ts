@@ -35,7 +35,16 @@
 //   - 配额 API 只在"确认配额耗尽"的 429 时才调用, 且有 cache 兜底
 
 import { execFile } from "node:child_process"
-import { existsSync, readFileSync, rmSync } from "node:fs"
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -54,11 +63,18 @@ type ProviderConfig = {
   apiKey?: string
 }
 
+type PatchConfig = {
+  enabled?: boolean
+  maxRetries?: number
+  restore?: boolean
+}
+
 type PluginConfig = {
   providers: ProviderConfig[]
   quotaCacheMs?: number
   syncEnabled?: boolean
   repo?: string
+  patch?: PatchConfig
 }
 
 const DEFAULT_QUOTA_URL = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
@@ -265,6 +281,169 @@ async function syncPlugin(repo: string, notify: (title: string, message: string)
   }
 }
 
+// ===== 二进制补丁: 修改 opencode 硬编码的 RETRY_MAX_RETRIES(5) =====
+// 原理: opencode 是 bun 单二进制, 内嵌 JS 明文。压缩后的常量链形如
+//   ...,TH=30000,DH=2147483647,RV=5,...  (RV 为重试上限变量)
+//   ...attempt>RV)...                     (上限判定点)
+// 锚定 2147483647(max delay)定位链, 等长替换:
+//   maxRetries=-1  → 比较式 attempt>RV) 改为恒假的 attempt<-1 ), 无限重试
+//   maxRetries=N   → 改链中 RV 的数值, 位数增减从 TH(30000, 无 headers 封顶)伸缩补偿
+// 写入走 tmp+rename(运行中二进制直接写会 ETXTBSY); 首次写入前备份 .retry-bak
+
+function opencodeBinaries(): string[] {
+  const out = new Set<string>()
+  try {
+    out.add(process.execPath)
+  } catch {}
+  try {
+    const nm = path.dirname(path.dirname(path.dirname(process.execPath)))
+    for (const dir of readdirSync(nm)) {
+      if (!dir.startsWith("opencode-")) continue
+      for (const name of ["opencode", "opencode.exe"]) {
+        const bin = path.join(nm, dir, "bin", name)
+        if (existsSync(bin)) out.add(bin)
+      }
+    }
+  } catch {}
+  return [...out]
+}
+
+type RetryChain = {
+  spanStart: number // ",TH=30000,DH=2147483647,RV=5" 的起始偏移(含前导逗号)
+  span: string // 该段原文
+  retryVar: string
+  retryVal: string
+}
+
+const MAX_DELAY_ANCHOR = "=2147483647,"
+
+function findRetryChain(buf: Buffer): RetryChain | undefined {
+  let idx = buf.indexOf(MAX_DELAY_ANCHOR)
+  while (idx !== -1) {
+    const after = buf.slice(idx + MAX_DELAY_ANCHOR.length, idx + MAX_DELAY_ANCHOR.length + 24).toString("latin1")
+    const m = after.match(/^([A-Za-z_$][\w$]{0,2})=(\d{1,3}),/)
+    if (m) {
+      const before = buf.slice(Math.max(0, idx - 40), idx).toString("latin1")
+      const mb = before.match(/,([A-Za-z_$][\w$]{0,2})=(\d{2,6}),[A-Za-z_$][\w$]{0,2}=$/)
+      if (mb) {
+        const spanStart = idx - mb[0].length
+        const span = buf
+          .slice(spanStart, idx + MAX_DELAY_ANCHOR.length + m[0].length)
+          .toString("latin1")
+        return { spanStart, span, retryVar: m[1], retryVal: m[2] }
+      }
+    }
+    idx = buf.indexOf(MAX_DELAY_ANCHOR, idx + 1)
+  }
+  return undefined
+}
+
+// 已打"无限"补丁的标记: .attempt< 后跟 -1/1 + 空格填充 + )
+function hasUnlimitedPatch(buf: Buffer): boolean {
+  const idx = buf.indexOf(".attempt<")
+  if (idx === -1) return false
+  return /^\.attempt<(?:-1|1)\s{0,2}\)/.test(buf.slice(idx, idx + 16).toString("latin1"))
+}
+
+// 等长构造"无限"比较式: ">RV)" → "<body )" (body=-1 或 1, 空格补齐)
+function unlimitedReplacement(retryVar: string): string | undefined {
+  const total = 1 + retryVar.length + 1 // ">RV)" 的长度
+  const body = retryVar.length >= 2 ? "-1" : "1"
+  let rep = `<${body})`
+  while (rep.length < total) rep = rep.slice(0, -1) + " )"
+  return rep.length === total ? rep : undefined
+}
+
+// 等长改写常量链: 调整 RV 数值, 位数差从 TH 值伸缩补偿(TH 新值 = "3"+零)
+function rewriteSpan(chain: RetryChain, want: number): string | undefined {
+  const m = chain.span.match(/^,([A-Za-z_$][\w$]{0,2})=(\d{2,6}),([A-Za-z_$][\w$]{0,2})=2147483647,/)
+  if (!m) return undefined
+  const [, thVar, thVal, dhVar] = m
+  const delta = String(want).length - chain.retryVal.length
+  const thDigits = thVal.length - delta
+  if (thDigits < 2 || thDigits > 7) return undefined
+  const newTh = "3" + "0".repeat(thDigits - 1)
+  const next = `,${thVar}=${newTh},${dhVar}=2147483647,${chain.retryVar}=${want}`
+  return next.length === chain.span.length ? next : undefined
+}
+
+function patchBinary(bin: string, want: number): "patched" | "already" | "notfound" | "unlimited-conflict" {
+  const buf = readFileSync(bin)
+  if (want === -1 && hasUnlimitedPatch(buf)) return "already"
+  const chain = findRetryChain(buf)
+  if (!chain) return "notfound"
+  const cmpOffset = buf.indexOf(`.attempt>${chain.retryVar})`)
+  if (want === -1) {
+    if (cmpOffset === -1) return hasUnlimitedPatch(buf) ? "already" : "notfound"
+    const rep = unlimitedReplacement(chain.retryVar)
+    if (!rep) return "notfound"
+    const at = cmpOffset + ".attempt".length
+    writePatched(bin, buf, [
+      { at, from: `>${chain.retryVar})`, to: rep },
+    ])
+    return "patched"
+  }
+  // 指定次数: 改链中数值
+  if (chain.retryVal === String(want) && cmpOffset !== -1) return "already"
+  if (cmpOffset === -1) return "unlimited-conflict"
+  const newSpan = rewriteSpan(chain, want)
+  if (!newSpan) return "notfound"
+  writePatched(bin, buf, [{ at: chain.spanStart, from: chain.span, to: newSpan }])
+  return "patched"
+}
+
+function writePatched(bin: string, buf: Buffer, edits: Array<{ at: number; from: string; to: string }>) {
+  for (const e of edits) {
+    if (buf.slice(e.at, e.at + e.from.length).toString("latin1") !== e.from) throw new Error(`patch verify fail at ${e.at}`)
+    buf.write(e.to, e.at, "latin1")
+  }
+  const bak = `${bin}.retry-bak`
+  if (!existsSync(bak)) copyFileSync(bin, bak)
+  const tmp = `${bin}.retry-patch-tmp`
+  writeFileSync(tmp, buf)
+  chmodSync(tmp, 0o755)
+  renameSync(tmp, bin)
+}
+
+function restoreBinary(bin: string): boolean {
+  const bak = `${bin}.retry-bak`
+  if (!existsSync(bak)) return false
+  const tmp = `${bin}.retry-restore-tmp`
+  copyFileSync(bak, tmp)
+  chmodSync(tmp, 0o755)
+  renameSync(tmp, bin)
+  return true
+}
+
+function runPatch(cfg: PatchConfig, notify: (title: string, message: string, variant?: "info" | "warning") => void) {
+  if (cfg.restore) {
+    let n = 0
+    for (const bin of opencodeBinaries()) {
+      try {
+        if (restoreBinary(bin)) n++
+      } catch {}
+    }
+    notify("quota-retry 补丁", n > 0 ? `已还原 ${n} 个二进制(来自 .retry-bak)` : "未找到备份, 无需还原")
+    return
+  }
+  const want = cfg.maxRetries ?? -1
+  if (want !== -1 && !(want >= 1 && want <= 999)) {
+    notify("quota-retry 补丁", "maxRetries 仅支持 -1(无限) 或 1-999", "warning")
+    return
+  }
+  for (const bin of opencodeBinaries()) {
+    try {
+      const r = patchBinary(bin, want)
+      if (r === "patched") notify("quota-retry 补丁", `重试上限已改为 ${want === -1 ? "无限" : want} (${path.basename(bin)}), 下次启动生效`)
+      else if (r === "already") notify("quota-retry 补丁", `已是目标状态, 跳过 (${path.basename(bin)})`)
+      else if (r === "unlimited-conflict") notify("quota-retry 补丁", `当前为无限补丁, 改指定次数请先 restore (${path.basename(bin)})`, "warning")
+      else notify("quota-retry 补丁", `未找到重试常量链, opencode 版本可能已大改, 跳过 (${path.basename(bin)})`, "warning")
+    } catch (e) {
+      notify("quota-retry 补丁", `写入失败: ${(e as Error).message} (${path.basename(bin)})`, "warning")
+    }
+  }
+}
+
 // 从 429 body 提取重置时刻(捕获组 1 = 完整时间串); 无时区后缀按 +08:00 解析。
 // 返回绝对毫秒时间戳, 解析失败返回 NaN
 function parseExtractedTime(m: RegExpMatchArray | null): number {
@@ -285,6 +464,9 @@ export default async function (input: { directory?: string; client?: any }) {
   if (pluginConfig.syncEnabled !== false) {
     syncPlugin(pluginConfig.repo ?? REPO, toast).catch(() => {})
   }
+  const patch = pluginConfig.patch
+  if (patch?.restore) runPatch({ restore: true }, toast)
+  else if (patch?.enabled) runPatch(patch, toast)
   const quotaCacheMs = pluginConfig.quotaCacheMs ?? DEFAULT_QUOTA_CACHE_MS
   // 缓存绝对重置时刻(而非相对 wait), 使用时再算差值, 避免缓存值随时间过期
   const cache = new Map<string, { at: number; resetAt: number }>()

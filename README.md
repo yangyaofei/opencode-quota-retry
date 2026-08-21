@@ -94,8 +94,34 @@ opencode 检测到缓存缺失会自动重新安装最新版（同步删除后�
 }
 ```
 
+## 二进制补丁（本分支新增：改重试次数上限）
+
+`patch-max-retries` 分支提供。每次 opencode 启动时自动检测并修改 opencode 二进制里硬编码的重试上限（`RETRY_MAX_RETRIES = 5`）：
+
+```jsonc
+{
+  "patch": {
+    "enabled": true,
+    "maxRetries": -1   // -1 = 无限重试; 或 1-999 指定次数
+  }
+}
+```
+
+- `-1`：把上限判定 `attempt > 5` 等长改写为恒假的 `attempt < -1`，无限重试
+- `1-999`：改常量链里的数值；位数增减从相邻的无 headers 封顶值（30000）伸缩补偿，文件总长度不变
+- 还原：`{"patch": {"enabled": false, "restore": true}}` 从 `.retry-bak` 备份恢复
+
+机制说明：
+
+- opencode 是 bun 单二进制，内嵌 JS 明文；插件按 `=2147483647,`（max delay 常量）锚定重试常量链 `,TH=30000,DH=2147483647,RV=5`，等长替换
+- 正在运行的二进制直接写会报 ETXTBSY，走临时文件 + rename 覆盖；改动在下次启动生效
+- 同时处理所有平台变体二进制（`opencode-linux-x64`、`opencode-linux-x64-baseline` 等）
+- 找不到常量链（opencode 版本大改）时跳过并 toast 提示，不做任何修改
+- 注意：npm 升级 opencode 后二进制被覆盖，下次启动插件会自动重打
+- 本分支若经 git URL 安装，请同时设 `"syncEnabled": false`（自同步按 master 比对，会删掉分支版本）
+
 ## 限制
 
-- 重试次数上限（5 次）插件无法修改。并发限流持续超过 5 × fallbackWaitMs 仍会中断。相关 issue：<https://github.com/anomalyco/opencode/issues/43596>
+- master 分支（无补丁）下重试次数上限 5 次够不到；本分支可用 `patch` 修改。相关上游 issue：<https://github.com/anomalyco/opencode/issues/43596>
 - 标题生成的重试不走这条路径，标题失败不影响正文
 - 未配置的 provider 不受影响
