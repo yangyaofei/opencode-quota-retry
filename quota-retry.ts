@@ -408,30 +408,28 @@ type PatchStatus = "patched" | "already" | "notfound" | "conflict" | "invalid"
 
 type PatchOpts = { maxRetries?: number; backoffCapMs?: number }
 
-// 期望态从"原始备份"推导: 配置未涉及的轴 = 出厂值(而非"保持现状"),
-// 保证检测出"配置里删掉了某项但二进制还留着旧补丁"的漂移
-function pristineChainOf(bin: string, buf: Buffer): RetryChain | undefined {
-  const bak = `${bin}.retry-bak`
-  if (!existsSync(bak)) return findRetryChain(buf)
-  try {
-    return findRetryChain(readFileSync(bak))
-  } catch {
-    return findRetryChain(buf)
-  }
-}
-
 const CHAIN_VALS_RE = /^,[A-Za-z_$][\w$]{0,2}=(\d{2,6}),[A-Za-z_$][\w$]{1,3}=\d{9,10},[A-Za-z_$][\w$]{0,2}=(\d{1,3})$/
 
 function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
   let buf = readFileSync(bin)
   let chain = findRetryChain(buf)
   if (!chain) return "notfound"
-  const pristine = pristineChainOf(bin, buf)
+
+  // 备份新鲜度: 等长补丁 size 恒不变, size 不同 = 跨版本旧备份, 不可用于还原。
+  // 当前二进制若已是出厂态, 弃旧备份直接以它为基线(打补丁时会重建备份)。
+  const bak = `${bin}.retry-bak`
+  if (existsSync(bak) && statSync(bak).size !== statSync(bin).size) {
+    if (hasUnlimitedPatch(buf) || hasBackoffCap(buf, chain)) return "conflict"
+    rmSync(bak)
+  }
+  const hasBak = existsSync(bak)
+
+  // 出厂基线: 有备份从备份读, 无备份当前即出厂
+  const pristine = hasBak ? findRetryChain(readFileSync(bak)) : chain
   if (!pristine) return "notfound"
   const pvals = pristine.span.match(CHAIN_VALS_RE)
   if (!pvals) return "notfound"
 
-  // 四轴期望状态
   const want = {
     unlimited: opts.maxRetries === -1,
     yh: opts.maxRetries !== undefined && opts.maxRetries > 0 ? opts.maxRetries : Number(pvals[2]),
@@ -439,55 +437,51 @@ function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
     cap: opts.backoffCapMs !== undefined,
   }
 
-  const readActual = (b: Buffer, c: RetryChain) => {
-    const cur = c.span.match(CHAIN_VALS_RE)
-    if (!cur) return undefined
-    return {
-      unlimited: hasUnlimitedPatch(b),
-      yh: Number(cur[2]),
-      th: Number(cur[1]),
-      cap: hasBackoffCap(b, c),
-      cmpIntact: b.indexOf(`.attempt>${c.retryVar})`) !== -1,
-    }
-  }
-  let actual = readActual(buf, chain)
-  if (!actual) return "notfound"
+  const cur = chain.span.match(CHAIN_VALS_RE)
+  if (!cur) return "notfound"
+  const sameState =
+    hasUnlimitedPatch(buf) === want.unlimited &&
+    Number(cur[2]) === want.yh &&
+    Number(cur[1]) === want.th &&
+    hasBackoffCap(buf, chain) === want.cap
+  if (sameState) return "already"
 
-  // 拆除类漂移(打了不该有的补丁)无法增量修复 → 整体还原后重打
-  const needRemove = (actual.unlimited && !want.unlimited) || (actual.cap && !want.cap)
-  if (needRemove) {
-    if (!existsSync(`${bin}.retry-bak`)) return "conflict"
-    restoreBinary(bin)
+  // 需要动手: 一律回到出厂态再整体重打, 不做任意历史布局间的增量改写
+  // (位数组合可能无解, 如 99 残留 + 单位次数目标)。出厂布局(5+10+1 位)在
+  // 入口校验空间内必有解, 长度方程整类消除。
+  if (hasBak) {
+    if (!restoreBinary(bin)) return "conflict"
     buf = readFileSync(bin)
     chain = findRetryChain(buf)
-    actual = chain ? readActual(buf, chain) : undefined
-    if (!chain || !actual) return "notfound"
+    if (!chain) return "notfound"
+  } else if (hasUnlimitedPatch(buf) || hasBackoffCap(buf, chain)) {
+    return "conflict" // 无备份却带着补丁标记, 出厂基线不明
   }
 
-  let touched = needRemove
-  // 常量链改写只动 th/dh/yh 三个数值, 不依赖比较点, 可安全执行
-  // (无限模式下 yh 是死代码, 顺手归一回出厂值, 状态更干净)
-  if (actual.th !== want.th || actual.yh !== want.yh) {
+  // 从出厂态一次性应用全部补丁(单次写入/重命名/重签名)
+  const fvals = chain.span.match(CHAIN_VALS_RE)
+  if (!fvals) return "notfound"
+  const edits: Array<{ at: number; from: string; to: string }> = []
+  if (want.th !== Number(fvals[1]) || want.yh !== Number(fvals[2])) {
     const newSpan = rewriteSpan(chain, want.th, want.yh)
     if (!newSpan) return "invalid"
-    writePatched(bin, buf, [{ at: chain.spanStart, from: chain.span, to: newSpan }])
-    touched = true
+    edits.push({ at: chain.spanStart, from: chain.span, to: newSpan })
   }
-  if (want.unlimited && !actual.unlimited) {
-    if (!actual.cmpIntact) return "conflict"
+  if (want.unlimited) {
+    const at = buf.indexOf(`.attempt>${chain.retryVar})`)
+    if (at === -1) return "notfound"
     const rep = unlimitedReplacement(chain.retryVar)
     if (!rep) return "notfound"
-    const at = buf.indexOf(`.attempt>${chain.retryVar})`) + ".attempt".length
-    writePatched(bin, buf, [{ at, from: `>${chain.retryVar})`, to: rep }])
-    touched = true
+    edits.push({ at: at + ".attempt".length, from: `>${chain.retryVar})`, to: rep })
   }
-  if (want.cap && !actual.cap) {
+  if (want.cap) {
     const site = findBackoffSite(buf, chain)
-    if (!site) return touched ? "patched" : "notfound"
-    writePatched(bin, buf, [{ at: site.at, from: site.from, to: semicolons(site.from.length) }])
-    touched = true
+    if (!site) return "notfound"
+    edits.push({ at: site.at, from: site.from, to: semicolons(site.from.length) })
   }
-  return touched ? "patched" : "already"
+  if (edits.length === 0) return "already"
+  writePatched(bin, buf, edits)
+  return "patched"
 }
 
 // ===== 退避封顶补丁: 有 responseHeaders 但无 retry-after 的分支 =====
