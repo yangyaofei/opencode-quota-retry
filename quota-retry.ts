@@ -66,6 +66,7 @@ type ProviderConfig = {
 type PatchConfig = {
   enabled?: boolean
   maxRetries?: number
+  backoffCapMs?: number
   restore?: boolean
 }
 
@@ -379,42 +380,103 @@ function unlimitedReplacement(retryVar: string): string | undefined {
   return rep.length === total ? rep : undefined
 }
 
-// 等长改写常量链: 调整 RV 数值, 位数差从 TH 值伸缩补偿(TH 新值 = "3"+零)
-function rewriteSpan(chain: RetryChain, want: number): string | undefined {
-  const m = chain.span.match(/^,([A-Za-z_$][\w$]{0,2})=(\d{2,6}),([A-Za-z_$][\w$]{0,2})=2147483647,/)
+// 等长改写常量链: th(退避封顶)/yh(重试次数) 设为目标值, 位数差由 dh 吸收。
+// dh 只允许缩到 999999999(9 位, ≈11.6 天), 仍高于一切现实的 retry-after 注入等待
+// (智谱 5h 窗口 ≈ 18M ms, 火山月度重置 ≈ 111M ms), 注入值不受影响。
+// 装不下(如 6 位封顶 + 2-3 位次数)返回 undefined, 调用方提示用户
+function rewriteSpan(chain: RetryChain, th: number, yh: number): string | undefined {
+  const m = chain.span.match(
+    /^,([A-Za-z_$][\w$]{0,2})=\d{2,6},([A-Za-z_$][\w$]{1,3})=(\d{9,10}),([A-Za-z_$][\w$]{0,2})=\d{1,3}$/,
+  )
   if (!m) return undefined
-  const [, thVar, thVal, dhVar] = m
-  const delta = String(want).length - chain.retryVal.length
-  const thDigits = thVal.length - delta
-  if (thDigits < 2 || thDigits > 7) return undefined
-  const newTh = "3" + "0".repeat(thDigits - 1)
-  const next = `,${thVar}=${newTh},${dhVar}=2147483647,${chain.retryVar}=${want}`
-  return next.length === chain.span.length ? next : undefined
+  const [, thVar, dhVar, dhVal, yhVar] = m
+  const build = (dh: string) => `,${thVar}=${th},${dhVar}=${dh},${yhVar}=${yh}`
+  if (build(dhVal).length === chain.span.length) return build(dhVal)
+  if (dhVal.length === 10 && build("999999999").length === chain.span.length) return build("999999999")
+  return undefined
 }
 
-function patchBinary(bin: string, want: number): "patched" | "already" | "notfound" | "unlimited-conflict" {
+type PatchStatus = "patched" | "already" | "notfound" | "conflict" | "invalid"
+
+type PatchOpts = { maxRetries?: number; backoffCapMs?: number }
+
+function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
   const buf = readFileSync(bin)
-  if (want === -1 && hasUnlimitedPatch(buf)) return "already"
+  let touched = false
+
   const chain = findRetryChain(buf)
   if (!chain) return "notfound"
   const cmpOffset = buf.indexOf(`.attempt>${chain.retryVar})`)
-  if (want === -1) {
-    if (cmpOffset === -1) return hasUnlimitedPatch(buf) ? "already" : "notfound"
-    const rep = unlimitedReplacement(chain.retryVar)
-    if (!rep) return "notfound"
-    const at = cmpOffset + ".attempt".length
-    writePatched(bin, buf, [
-      { at, from: `>${chain.retryVar})`, to: rep },
-    ])
-    return "patched"
+
+  // --- 常量链改写: th(退避封顶)/yh(重试次数) ---
+  const cur = chain.span.match(
+    /^,[A-Za-z_$][\w$]{0,2}=(\d{2,6}),[A-Za-z_$][\w$]{1,3}=\d{9,10},[A-Za-z_$][\w$]{0,2}=(\d{1,3})$/,
+  )
+  if (!cur) return "notfound"
+  const thTarget = opts.backoffCapMs ?? Number(cur[1])
+  const yhTarget = opts.maxRetries !== undefined && opts.maxRetries > 0 ? opts.maxRetries : Number(cur[2])
+  if (thTarget !== Number(cur[1]) || yhTarget !== Number(cur[2])) {
+    // 改次数需要比较点完好(已被无限补丁改写则冲突); 只改封顶不冲突
+    if (yhTarget !== Number(cur[2]) && cmpOffset === -1) return "conflict"
+    const newSpan = rewriteSpan(chain, thTarget, yhTarget)
+    if (!newSpan) return "invalid"
+    writePatched(bin, buf, [{ at: chain.spanStart, from: chain.span, to: newSpan }])
+    touched = true
   }
-  // 指定次数: 改链中数值
-  if (chain.retryVal === String(want) && cmpOffset !== -1) return "already"
-  if (cmpOffset === -1) return "unlimited-conflict"
-  const newSpan = rewriteSpan(chain, want)
-  if (!newSpan) return "notfound"
-  writePatched(bin, buf, [{ at: chain.spanStart, from: chain.span, to: newSpan }])
-  return "patched"
+
+  // --- 无限次数: 比较点 .attempt>RV) 改恒假 ---
+  if (opts.maxRetries === -1 && !hasUnlimitedPatch(buf)) {
+    if (cmpOffset === -1) return touched ? "patched" : "notfound"
+    const rep = unlimitedReplacement(chain.retryVar)
+    if (!rep) return touched ? "patched" : "notfound"
+    writePatched(bin, buf, [{ at: cmpOffset + ".attempt".length, from: `>${chain.retryVar})`, to: rep }])
+    touched = true
+  }
+
+  // --- 退避封顶: 无 retry-after 分支落体到 Math.min(eh,th) ---
+  if (opts.backoffCapMs !== undefined && !hasBackoffCap(buf)) {
+    const site = findBackoffSite(buf)
+    if (!site) return touched ? "patched" : "notfound"
+    writePatched(bin, buf, [{ at: site.at, from: site.from, to: semicolons(site.from.length) }])
+    touched = true
+  }
+
+  return touched ? "patched" : "already"
+}
+
+// ===== 退避封顶补丁: 有 responseHeaders 但无 retry-after 的分支 =====
+// 原码: ...return cl(Math.ceil(f))}return cl(eh(e,l))}}return cl(Math.min(eh(e,l),th))
+//   前者(headers 存在但无 retry-after 值)指数退避无封顶(实测 38s/76s 一路翻倍到 24.8 天)
+// 改法: 等长替换为空语句(18 个分号), 控制流落到函数末尾
+//   return cl(Math.min(eh(e,l),th)) —— 与无 headers 分支共用 30s 封顶
+// retry-after / retry-after-ms 注入路径在前面提前 return, 不经过此处, 等待值不受影响
+
+const BACKOFF_RETURN_RE = /return [a-z_$]{1,3}\([a-z_$]{1,3}\([a-z_$]{1,3},[a-z_$]{1,3}\)\)\}\}return [a-z_$]{1,3}\(Math\.min\([a-z_$]{1,3}\([a-z_$]{1,3},[a-z_$]{1,3}\),[a-z_$]{1,3}\)\)/
+
+type BackoffSite = { at: number; from: string }
+
+function findBackoffSite(buf: Buffer): BackoffSite | undefined {
+  // 在 retry 常量链之后 2KB 内找 "return XX(YY(a,b))}}" 且后面紧跟 "return XX(Math.min(...))"
+  const anchor = buf.indexOf(MAX_DELAY_ANCHOR)
+  if (anchor === -1) return undefined
+  const seg = buf.slice(anchor, anchor + 2048).toString("latin1")
+  const m = seg.match(BACKOFF_RETURN_RE)
+  if (!m) return undefined
+  // 只替换开头的 return XX(YY(a,b)) 部分, }} 保留(否则块结构被破坏)
+  const head = m[0].match(/^return [a-z_$]{1,3}\([a-z_$]{1,3}\([a-z_$]{1,3},[a-z_$]{1,3}\)\)/)!
+  return { at: anchor + m.index!, from: head }
+}
+
+// 已打封顶补丁的检测: 常量链窗口内出现连续分号(原 return 语句被替换)后紧跟 return XX(Math.min
+function hasBackoffCap(buf: Buffer): boolean {
+  const anchor = buf.indexOf(MAX_DELAY_ANCHOR)
+  if (anchor === -1) return false
+  const seg = buf.slice(anchor, anchor + 2048).toString("latin1")
+  return /;{12,}\}\}return [a-z_$]{1,3}\(Math\.min/.test(seg)
+}
+
+function semicolons(n: number): string {
+  return ";".repeat(n)
 }
 
 // macOS 要求二进制有代码签名(至少 ad-hoc); 修改字节后签名失效,
@@ -465,17 +527,35 @@ function runPatch(cfg: PatchConfig, notify: (title: string, message: string, var
     notify("quota-retry 补丁", n > 0 ? `已还原 ${n} 个二进制(来自 .retry-bak)` : "未找到备份, 无需还原")
     return
   }
-  const want = cfg.maxRetries ?? -1
-  if (want !== -1 && !(want >= 1 && want <= 999)) {
+  const maxRetries = cfg.maxRetries ?? -1
+  if (maxRetries !== -1 && !(maxRetries >= 1 && maxRetries <= 999)) {
     notify("quota-retry 补丁", "maxRetries 仅支持 -1(无限) 或 1-999", "warning")
     return
   }
+  const cap = cfg.backoffCapMs
+  if (cap !== undefined && !(cap >= 10_000 && cap <= 999_999)) {
+    notify("quota-retry 补丁", "backoffCapMs 仅支持 10000-999999 (10s 到 16.6 分钟)", "warning")
+    return
+  }
+  const label = [
+    `重试上限 ${maxRetries === -1 ? "无限" : maxRetries}`,
+    cap ? `退避封顶 ${cap / 1000}s` : "",
+  ]
+    .filter(Boolean)
+    .join(", ")
   for (const bin of opencodeBinaries()) {
     try {
-      const r = patchBinary(bin, want)
-      if (r === "patched") notify("quota-retry 补丁", `重试上限已改为 ${want === -1 ? "无限" : want} (${path.basename(bin)}), 下次启动生效`)
+      const r = patchBinary(bin, { maxRetries, backoffCapMs: cap })
+      if (r === "patched") notify("quota-retry 补丁", `${label} 已写入 (${path.basename(bin)}), 下次启动生效`)
       else if (r === "already") notify("quota-retry 补丁", `已是目标状态, 跳过 (${path.basename(bin)})`)
-      else if (r === "unlimited-conflict") notify("quota-retry 补丁", `当前为无限补丁, 改指定次数请先 restore (${path.basename(bin)})`, "warning")
+      else if (r === "conflict")
+        notify("quota-retry 补丁", `当前为无限补丁, 改指定次数请先 restore (${path.basename(bin)})`, "warning")
+      else if (r === "invalid")
+        notify(
+          "quota-retry 补丁",
+          `位数装不下: 退避封顶(6 位数)与重试次数(2-3 位数)不能同时设置, 请二选一调小 (${path.basename(bin)})`,
+          "warning",
+        )
       else notify("quota-retry 补丁", `未找到重试常量链, opencode 版本可能已大改, 跳过 (${path.basename(bin)})`, "warning")
     } catch (e) {
       const msg = (e as Error).message.includes("codesign")
