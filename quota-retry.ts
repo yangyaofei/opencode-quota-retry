@@ -434,8 +434,8 @@ function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
   }
 
   // --- 退避封顶: 无 retry-after 分支落体到 Math.min(eh,th) ---
-  if (opts.backoffCapMs !== undefined && !hasBackoffCap(buf)) {
-    const site = findBackoffSite(buf)
+  if (opts.backoffCapMs !== undefined && !hasBackoffCap(buf, chain)) {
+    const site = findBackoffSite(buf, chain)
     if (!site) return touched ? "patched" : "notfound"
     writePatched(bin, buf, [{ at: site.at, from: site.from, to: semicolons(site.from.length) }])
     touched = true
@@ -455,24 +455,26 @@ const BACKOFF_RETURN_RE = /return [a-z_$]{1,3}\([a-z_$]{1,3}\([a-z_$]{1,3},[a-z_
 
 type BackoffSite = { at: number; from: string }
 
-function findBackoffSite(buf: Buffer): BackoffSite | undefined {
-  // 在 retry 常量链之后 2KB 内找 "return XX(YY(a,b))}}" 且后面紧跟 "return XX(Math.min(...))"
-  const anchor = buf.indexOf(MAX_DELAY_ANCHOR)
-  if (anchor === -1) return undefined
-  const seg = buf.slice(anchor, anchor + 2048).toString("latin1")
+// delay 函数紧跟在常量链之后: 从 chain 尾部起取窗口(不能 indexOf 锚点,
+// 二进制里第一处 =2147483647, 是无关的 kMaxLength)
+function backoffWindow(buf: Buffer, chain: RetryChain): string {
+  const start = chain.spanStart + chain.span.length
+  return buf.slice(start, start + 2048).toString("latin1")
+}
+
+function findBackoffSite(buf: Buffer, chain: RetryChain): BackoffSite | undefined {
+  // 窗口内找 "return XX(YY(a,b))}}" 且后面紧跟 "return XX(Math.min(...))"
+  const seg = backoffWindow(buf, chain)
   const m = seg.match(BACKOFF_RETURN_RE)
   if (!m) return undefined
   // 只替换开头的 return XX(YY(a,b)) 部分, }} 保留(否则块结构被破坏)
   const head = m[0].match(/^return [a-z_$]{1,3}\([a-z_$]{1,3}\([a-z_$]{1,3},[a-z_$]{1,3}\)\)/)!
-  return { at: anchor + m.index!, from: head }
+  return { at: chain.spanStart + chain.span.length + m.index!, from: head }
 }
 
-// 已打封顶补丁的检测: 常量链窗口内出现连续分号(原 return 语句被替换)后紧跟 return XX(Math.min
-function hasBackoffCap(buf: Buffer): boolean {
-  const anchor = buf.indexOf(MAX_DELAY_ANCHOR)
-  if (anchor === -1) return false
-  const seg = buf.slice(anchor, anchor + 2048).toString("latin1")
-  return /;{12,}\}\}return [a-z_$]{1,3}\(Math\.min/.test(seg)
+// 已打封顶补丁的检测: 窗口内出现连续分号(原 return 语句被替换)后紧跟 return XX(Math.min
+function hasBackoffCap(buf: Buffer, chain: RetryChain): boolean {
+  return /;{12,}\}\}return [a-z_$]{1,3}\(Math\.min/.test(backoffWindow(buf, chain))
 }
 
 function semicolons(n: number): string {
