@@ -402,47 +402,85 @@ type PatchStatus = "patched" | "already" | "notfound" | "conflict" | "invalid"
 
 type PatchOpts = { maxRetries?: number; backoffCapMs?: number }
 
+// 期望态从"原始备份"推导: 配置未涉及的轴 = 出厂值(而非"保持现状"),
+// 保证检测出"配置里删掉了某项但二进制还留着旧补丁"的漂移
+function pristineChainOf(bin: string, buf: Buffer): RetryChain | undefined {
+  const bak = `${bin}.retry-bak`
+  if (!existsSync(bak)) return findRetryChain(buf)
+  try {
+    return findRetryChain(readFileSync(bak))
+  } catch {
+    return findRetryChain(buf)
+  }
+}
+
+const CHAIN_VALS_RE = /^,[A-Za-z_$][\w$]{0,2}=(\d{2,6}),[A-Za-z_$][\w$]{1,3}=\d{9,10},[A-Za-z_$][\w$]{0,2}=(\d{1,3})$/
+
 function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
-  const buf = readFileSync(bin)
-  let touched = false
-
-  const chain = findRetryChain(buf)
+  let buf = readFileSync(bin)
+  let chain = findRetryChain(buf)
   if (!chain) return "notfound"
-  const cmpOffset = buf.indexOf(`.attempt>${chain.retryVar})`)
+  const pristine = pristineChainOf(bin, buf)
+  if (!pristine) return "notfound"
+  const pvals = pristine.span.match(CHAIN_VALS_RE)
+  if (!pvals) return "notfound"
 
-  // --- 常量链改写: th(退避封顶)/yh(重试次数) ---
-  const cur = chain.span.match(
-    /^,[A-Za-z_$][\w$]{0,2}=(\d{2,6}),[A-Za-z_$][\w$]{1,3}=\d{9,10},[A-Za-z_$][\w$]{0,2}=(\d{1,3})$/,
-  )
-  if (!cur) return "notfound"
-  const thTarget = opts.backoffCapMs ?? Number(cur[1])
-  const yhTarget = opts.maxRetries !== undefined && opts.maxRetries > 0 ? opts.maxRetries : Number(cur[2])
-  if (thTarget !== Number(cur[1]) || yhTarget !== Number(cur[2])) {
-    // 改次数需要比较点完好(已被无限补丁改写则冲突); 只改封顶不冲突
-    if (yhTarget !== Number(cur[2]) && cmpOffset === -1) return "conflict"
-    const newSpan = rewriteSpan(chain, thTarget, yhTarget)
+  // 四轴期望状态
+  const want = {
+    unlimited: opts.maxRetries === -1,
+    yh: opts.maxRetries !== undefined && opts.maxRetries > 0 ? opts.maxRetries : Number(pvals[2]),
+    th: opts.backoffCapMs ?? Number(pvals[1]),
+    cap: opts.backoffCapMs !== undefined,
+  }
+
+  const readActual = (b: Buffer, c: RetryChain) => {
+    const cur = c.span.match(CHAIN_VALS_RE)
+    if (!cur) return undefined
+    return {
+      unlimited: hasUnlimitedPatch(b),
+      yh: Number(cur[2]),
+      th: Number(cur[1]),
+      cap: hasBackoffCap(b, c),
+      cmpIntact: b.indexOf(`.attempt>${c.retryVar})`) !== -1,
+    }
+  }
+  let actual = readActual(buf, chain)
+  if (!actual) return "notfound"
+
+  // 拆除类漂移(打了不该有的补丁)无法增量修复 → 整体还原后重打
+  const needRemove = (actual.unlimited && !want.unlimited) || (actual.cap && !want.cap)
+  if (needRemove) {
+    if (!existsSync(`${bin}.retry-bak`)) return "conflict"
+    restoreBinary(bin)
+    buf = readFileSync(bin)
+    chain = findRetryChain(buf)
+    actual = chain ? readActual(buf, chain) : undefined
+    if (!chain || !actual) return "notfound"
+  }
+
+  let touched = needRemove
+  // 常量链改写只动 th/dh/yh 三个数值, 不依赖比较点, 可安全执行
+  // (无限模式下 yh 是死代码, 顺手归一回出厂值, 状态更干净)
+  if (actual.th !== want.th || actual.yh !== want.yh) {
+    const newSpan = rewriteSpan(chain, want.th, want.yh)
     if (!newSpan) return "invalid"
     writePatched(bin, buf, [{ at: chain.spanStart, from: chain.span, to: newSpan }])
     touched = true
   }
-
-  // --- 无限次数: 比较点 .attempt>RV) 改恒假 ---
-  if (opts.maxRetries === -1 && !hasUnlimitedPatch(buf)) {
-    if (cmpOffset === -1) return touched ? "patched" : "notfound"
+  if (want.unlimited && !actual.unlimited) {
+    if (!actual.cmpIntact) return "conflict"
     const rep = unlimitedReplacement(chain.retryVar)
-    if (!rep) return touched ? "patched" : "notfound"
-    writePatched(bin, buf, [{ at: cmpOffset + ".attempt".length, from: `>${chain.retryVar})`, to: rep }])
+    if (!rep) return "notfound"
+    const at = buf.indexOf(`.attempt>${chain.retryVar})`) + ".attempt".length
+    writePatched(bin, buf, [{ at, from: `>${chain.retryVar})`, to: rep }])
     touched = true
   }
-
-  // --- 退避封顶: 无 retry-after 分支落体到 Math.min(eh,th) ---
-  if (opts.backoffCapMs !== undefined && !hasBackoffCap(buf, chain)) {
+  if (want.cap && !actual.cap) {
     const site = findBackoffSite(buf, chain)
     if (!site) return touched ? "patched" : "notfound"
     writePatched(bin, buf, [{ at: site.at, from: site.from, to: semicolons(site.from.length) }])
     touched = true
   }
-
   return touched ? "patched" : "already"
 }
 
@@ -604,7 +642,7 @@ function runPatch(cfg: PatchConfig, notify: (title: string, message: string, var
         const r = patchBinary(bin, { maxRetries, backoffCapMs: cap })
         if (r === "patched") notify("quota-retry 补丁", `${label} 已写入 (${path.basename(bin)}), 下次启动生效`)
         else if (r === "conflict")
-          notify("quota-retry 补丁", `当前为无限补丁, 改指定次数请先 restore (${path.basename(bin)})`, "warning")
+          notify("quota-retry 补丁", `需拆除已打补丁但找不到 .retry-bak 备份, 请重装 opencode 后重启 (${path.basename(bin)})`, "warning")
         else if (r === "invalid")
           notify("quota-retry 补丁", `位数装不下: 封顶与次数组合超出等长预算 (${path.basename(bin)})`, "warning")
         else if (r === "notfound")
