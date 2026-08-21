@@ -339,29 +339,33 @@ type RetryChain = {
   retryVal: string
 }
 
-const MAX_DELAY_ANCHOR = "=2147483647,"
+// 锚点双值: 出厂绝对上限 2147483647, 以及位吸收后的 999999999
+// (改过次数后 dh 不再是出厂值, 单一锚点会找不到自己打过补丁的链)
+const MAX_DELAY_ANCHORS = ["=2147483647,", "=999999999,"]
 
 function findRetryChain(buf: Buffer): RetryChain | undefined {
-  let idx = buf.indexOf(MAX_DELAY_ANCHOR)
-  while (idx !== -1) {
-    const after = buf
-      .slice(idx + MAX_DELAY_ANCHOR.length, idx + MAX_DELAY_ANCHOR.length + 24)
-      .toString("latin1")
-    // 锚点后紧跟: RV=NUM,
-    const m = after.match(/^([A-Za-z_$][\w$]{0,2})=(\d{1,3}),/)
-    if (m) {
-      // 锚点前(不含锚点的'='): ,TH=NUM,DH  —— 切片止于 DH 变量名, 无 '='
-      const beforeStart = Math.max(0, idx - 40)
-      const before = buf.slice(beforeStart, idx).toString("latin1")
-      const mb = before.match(/,([A-Za-z_$][\w$]{0,2})=(\d{2,6}),([A-Za-z_$][\w$]{0,2})$/)
-      if (mb) {
-        const spanStart = beforeStart + mb.index!
-        const spanEnd = idx + MAX_DELAY_ANCHOR.length + m[0].length - 1 // 去掉尾逗号
-        const span = buf.slice(spanStart, spanEnd).toString("latin1")
-        return { spanStart, span, retryVar: m[1], retryVal: m[2] }
+  for (const anchor of MAX_DELAY_ANCHORS) {
+    let idx = buf.indexOf(anchor)
+    while (idx !== -1) {
+      const after = buf
+        .slice(idx + anchor.length, idx + anchor.length + 24)
+        .toString("latin1")
+      // 锚点后紧跟: RV=NUM,
+      const m = after.match(/^([A-Za-z_$][\w$]{0,2})=(\d{1,3}),/)
+      if (m) {
+        // 锚点前(不含锚点的'='): ,TH=NUM,DH  —— 切片止于 DH 变量名, 无 '='
+        const beforeStart = Math.max(0, idx - 40)
+        const before = buf.slice(beforeStart, idx).toString("latin1")
+        const mb = before.match(/,([A-Za-z_$][\w$]{0,2})=(\d{2,6}),([A-Za-z_$][\w$]{0,2})$/)
+        if (mb) {
+          const spanStart = beforeStart + mb.index!
+          const spanEnd = idx + anchor.length + m[0].length - 1 // 去掉尾逗号
+          const span = buf.slice(spanStart, spanEnd).toString("latin1")
+          return { spanStart, span, retryVar: m[1], retryVal: m[2] }
+        }
       }
+      idx = buf.indexOf(anchor, idx + 1)
     }
-    idx = buf.indexOf(MAX_DELAY_ANCHOR, idx + 1)
   }
   return undefined
 }
@@ -391,10 +395,12 @@ function rewriteSpan(chain: RetryChain, th: number, yh: number): string | undefi
     /^,([A-Za-z_$][\w$]{0,2})=\d{2,6},([A-Za-z_$][\w$]{1,3})=(\d{9,10}),([A-Za-z_$][\w$]{0,2})=\d{1,3}$/,
   )
   if (!m) return undefined
-  const [, thVar, dhVar, dhVal, yhVar] = m
+  const [, thVar, dhVar, yhVar] = m
+  // dh 双向伸缩: 优先恢复出厂绝对上限, 装不下则收缩到 999999999
   const build = (dh: string) => `,${thVar}=${th},${dhVar}=${dh},${yhVar}=${yh}`
-  if (build(dhVal).length === chain.span.length) return build(dhVal)
-  if (dhVal.length === 10 && build("999999999").length === chain.span.length) return build("999999999")
+  for (const dh of ["2147483647", "999999999"]) {
+    if (build(dh).length === chain.span.length) return build(dh)
+  }
   return undefined
 }
 
