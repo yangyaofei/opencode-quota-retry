@@ -372,6 +372,38 @@ function findRetryChain(buf: Buffer): RetryChain | undefined {
   return undefined
 }
 
+// 从"已打补丁"的二进制反推"功能上的出厂态"(仅用于备份过期/丢失时重建备份):
+// 两个补丁标记都是等长替换, 逆向等长换回即可——
+//   无限标记  .attempt<-1)  →  .attempt>RV)     (RV 从常量链取, 变量名 1-2 位时等长)
+//   封顶分号  ;;;;;...      →  return XX(YY(a,b))  (函数/变量名从紧随其后的
+//                              return XX(Math.min(YY(a,b),TH)) 尾巴里取, 等长)
+// 常量链保持原样(本来就是出厂值时字节精确; 改过次数时功能等价)。
+// 返回 null 表示任一步无法等长还原(版本结构变化), 调用方按 conflict 处理
+function synthesizePristine(buf: Buffer, chain: RetryChain): Buffer | null {
+  const out = Buffer.from(buf)
+  // 1. 反转无限标记
+  const mIdx = out.indexOf(".attempt<")
+  if (mIdx !== -1) {
+    const seg = out.slice(mIdx, mIdx + 16).toString("latin1")
+    const m = seg.match(/^\.attempt<(?:-1|1)(\s{0,2})\)/)
+    if (!m) return null
+    const back = `.attempt>${chain.retryVar})`
+    if (back.length !== m[0].length) return null
+    out.write(back, mIdx, "latin1")
+  }
+  // 2. 反转封顶分号: ;;;;..}}return XX(Math.min(YY(a,b),TH)) → 分号换回 return XX(YY(a,b))
+  const win = backoffWindow(out, chain)
+  const m2 = win.match(/;{12,}\}\}return ([a-z_$]{1,3})\(Math\.min\(([a-z_$]{1,3})\(([a-z_$]{1,3}),([a-z_$]{1,3})\),[a-z_$]{1,3}\)/)
+  if (m2) {
+    const head = `return ${m2[1]}(${m2[2]}(${m2[3]},${m2[4]}))`
+    const semis = m2[0].match(/^;+/)![0].length
+    if (head.length !== semis) return null
+    const at = chain.spanStart + chain.span.length + m2.index!
+    out.write(head, at, "latin1")
+  }
+  return out
+}
+
 // 已打"无限"补丁的标记: .attempt< 后跟 -1/1 + 空格填充 + )
 function hasUnlimitedPatch(buf: Buffer): boolean {
   const idx = buf.indexOf(".attempt<")
@@ -393,8 +425,10 @@ function unlimitedReplacement(retryVar: string): string | undefined {
 // (智谱 5h 窗口 ≈ 18M ms, 火山月度重置 ≈ 111M ms), 注入值不受影响。
 // 装不下(如 6 位封顶 + 2-3 位次数)返回 undefined, 调用方提示用户
 function rewriteSpan(chain: RetryChain, th: number, yh: number): string | undefined {
+  // 注意: 数字部分不加捕获括号, 保证 m[1]/m[2]/m[3] 恰为三个变量名
+  // (曾因 (\d{9,10}) 多一对括号导致解构错位, yhVar 拿到数字, 场景 C 失败的真根因)
   const m = chain.span.match(
-    /^,([A-Za-z_$][\w$]{0,2})=\d{2,6},([A-Za-z_$][\w$]{1,3})=(\d{9,10}),([A-Za-z_$][\w$]{0,2})=\d{1,3}$/,
+    /^,([A-Za-z_$][\w$]{0,2})=\d{2,6},([A-Za-z_$][\w$]{1,3})=\d{9,10},([A-Za-z_$][\w$]{0,2})=\d{1,3}$/,
   )
   if (!m) return undefined
   const [, thVar, dhVar, yhVar] = m
@@ -417,21 +451,38 @@ function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
   let chain = findRetryChain(buf)
   if (!chain) return "notfound"
 
-  // 备份新鲜度: 等长补丁 size 恒不变, size 不同 = 跨版本旧备份, 不可用于还原。
-  // 当前二进制若已是出厂态, 弃旧备份直接以它为基线(打补丁时会重建备份)。
-  const bak = `${bin}.retry-bak`
-  if (existsSync(bak) && statSync(bak).size !== statSync(bin).size) {
-    if (hasUnlimitedPatch(buf) || hasBackoffCap(buf, chain)) return "conflict"
-    rmSync(bak)
-  }
-  const hasBak = existsSync(bak)
+  const cur0 = chain.span.match(CHAIN_VALS_RE)
+  if (!cur0) return "notfound"
 
-  // 出厂基线: 有备份从备份读, 无备份当前即出厂
-  const pristine = hasBak ? findRetryChain(readFileSync(bak)) : chain
-  if (!pristine) return "notfound"
-  const pvals = pristine.span.match(CHAIN_VALS_RE)
+  // 备份新鲜度: 等长补丁 size 恒不变, size 不同 = 跨版本旧备份。
+  // 备份过期/丢失时: 当前二进制无补丁标记 → 它本身就是出厂态;
+  // 带补丁标记 → 从当前二进制反推(等长逆向)重建一份功能出厂态备份
+  const bak = `${bin}.retry-bak`
+  const bakStale = existsSync(bak) && statSync(bak).size !== statSync(bin).size
+  const pristine = (() => {
+    if (!bakStale && existsSync(bak)) {
+      const b = findRetryChain(readFileSync(bak))
+      return b ? { chain: b, src: readFileSync(bak) } : undefined
+    }
+    if (!hasUnlimitedPatch(buf) && !hasBackoffCap(buf, chain)) {
+      if (bakStale) writeBak(bin, buf) // 无标记 = 出厂态, 直接以它重建备份
+      return { chain, src: buf }
+    }
+    const syn = synthesizePristine(buf, chain)
+    if (!syn) return undefined
+    const synChain = findRetryChain(syn)
+    if (!synChain || hasUnlimitedPatch(syn) || hasBackoffCap(syn, synChain)) return undefined
+    writeBak(bin, syn)
+    return { chain: synChain, src: syn }
+  })()
+  if (!pristine) {
+    rmSync(bak, { force: true }) // 不可用的备份不如没有
+    return "conflict"
+  }
+  const pvals = pristine.chain.span.match(CHAIN_VALS_RE)
   if (!pvals) return "notfound"
 
+  // 期望态: 显式配置优先, 未配置的轴 = 出厂值
   const want = {
     unlimited: opts.maxRetries === -1,
     yh: opts.maxRetries !== undefined && opts.maxRetries > 0 ? opts.maxRetries : Number(pvals[2]),
@@ -439,25 +490,19 @@ function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
     cap: opts.backoffCapMs !== undefined,
   }
 
-  const cur = chain.span.match(CHAIN_VALS_RE)
-  if (!cur) return "notfound"
+  // 已在目标态: 不动二进制(次数在无限模式下是死代码, 不比较; 过期备份已在上面重建)
   const sameState =
     hasUnlimitedPatch(buf) === want.unlimited &&
-    Number(cur[2]) === want.yh &&
-    Number(cur[1]) === want.th &&
-    hasBackoffCap(buf, chain) === want.cap
+    (want.unlimited || Number(cur0[2]) === want.yh) &&
+    (want.cap ? Number(cur0[1]) === want.th : !hasBackoffCap(buf, chain))
   if (sameState) return "already"
 
   // 需要动手: 一律回到出厂态再整体重打, 不做任意历史布局间的增量改写
-  // (位数组合可能无解, 如 99 残留 + 单位次数目标)。出厂布局(5+10+1 位)在
-  // 入口校验空间内必有解, 长度方程整类消除。
-  if (hasBak) {
+  if (bakStale || existsSync(bak)) {
     if (!restoreBinary(bin)) return "conflict"
     buf = readFileSync(bin)
     chain = findRetryChain(buf)
     if (!chain) return "notfound"
-  } else if (hasUnlimitedPatch(buf) || hasBackoffCap(buf, chain)) {
-    return "conflict" // 无备份却带着补丁标记, 出厂基线不明
   }
 
   // 从出厂态一次性应用全部补丁(单次写入/重命名/重签名)
@@ -484,6 +529,19 @@ function patchBinary(bin: string, opts: PatchOpts): PatchStatus {
   if (edits.length === 0) return "already"
   writePatched(bin, buf, edits)
   return "patched"
+}
+
+// 备份写入: tmp + rename 原子替换(内容可能是合成的出厂态 Buffer)
+function writeBak(bin: string, content: Buffer) {
+  const tmp = `${bin}.retry-bak-tmp`
+  try {
+    writeFileSync(tmp, content)
+    chmodSync(tmp, 0o755)
+    renameSync(tmp, `${bin}.retry-bak`)
+  } catch (e) {
+    rmSync(tmp, { force: true })
+    throw e
+  }
 }
 
 // ===== 退避封顶补丁: 有 responseHeaders 但无 retry-after 的分支 =====
@@ -785,7 +843,7 @@ function patchStatusReport(projectDir: string, binsOverride?: string[]): string 
         const bv = findRetryChain(readFileSync(bak))?.span.match(CHAIN_VALS_RE)
         if (bv) factory = { th: Number(bv[1]), yh: Number(bv[2]) }
       } else {
-        bakNote = "备份与当前二进制版本不一致(跨版本旧备份)"
+        bakNote = "备份与当前二进制版本不一致(跨版本旧备份), 下次需要改动时自动从当前二进制重建"
         if (!actual.unlimited && !actual.cap) factory = { th: actual.th, yh: actual.yh }
       }
     } else if (!actual.unlimited && !actual.cap) {
@@ -812,7 +870,12 @@ function patchStatusReport(projectDir: string, binsOverride?: string[]): string 
       actual.unlimited ? "已开启" : "未开启",
       want ? (want.unlimited ? "已开启" : "未开启") : undefined,
     )
-    cmp("次数上限", `${actual.yh} 次`, want?.yh !== undefined ? `${want.yh} 次` : undefined)
+    if (actual.unlimited) {
+      // 无限模式下次数判定恒假, 次数上限是死代码, 不再单列误导
+      lines.push("  次数上限: 不适用(无限重试已开启, 次数判定不参与)")
+    } else {
+      cmp("次数上限", `${actual.yh} 次`, want?.yh !== undefined ? `${want.yh} 次` : undefined)
+    }
     cmp("退避封顶", actual.cap ? `${actual.th}ms` : `未开启(指数退避无上限, 绝对上限 ${actual.th}ms)`, want ? (want.cap ? `${want.th}ms` : "未开启") : undefined)
 
     const rec = state[bin]
@@ -823,7 +886,7 @@ function patchStatusReport(projectDir: string, binsOverride?: string[]): string 
     } else {
       lines.push("  状态缓存: 无记录(下次启动全量检查)")
     }
-    if (bakNote) lines.push(`  备份: ${bakNote}${factory ? ", 当前无补丁标记, 以当前链为出厂基线" : ", 且当前带补丁标记, 下次启动按 conflict 处理"}`)
+    if (bakNote) lines.push(`  备份: ${bakNote}`)
   })
   return lines.join("\n")
 }
@@ -989,6 +1052,6 @@ async function quotaRetryPlugin(input: { directory?: string; client?: any }) {
 // 测试钩子挂在默认导出函数的属性上: opencode 要求模块的所有导出均为插件函数,
 // 多余的具名导出(无论函数还是对象)都会导致加载失败
 // (曾因 export { patchStatusReport } 报 paths[0] 类型错误, 对象导出报 not a function)
-;(quotaRetryPlugin as any).__internals = { patchStatusReport }
+;(quotaRetryPlugin as any).__internals = { patchStatusReport, patchBinary, synthesizePristine, findRetryChain, hasUnlimitedPatch, hasBackoffCap }
 
 export default quotaRetryPlugin
