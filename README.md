@@ -94,57 +94,79 @@ opencode 检测到缓存缺失会自动重新安装最新版（同步删除后�
 }
 ```
 
-## 二进制补丁（本分支新增：改重试次数上限）
+## 二进制补丁（patch-max-retries 分支）
 
-`patch-max-retries` 分支提供。每次 opencode 启动时自动检测并修改 opencode 二进制里硬编码的重试上限（`RETRY_MAX_RETRIES = 5`）：
+master 分支不碰二进制。本分支额外把 opencode 硬编码的重试参数变成可配置。
+
+### 为什么需要
+
+opencode 把重试策略硬编码在源码里（`packages/opencode/src/session/retry.ts`），**没有任何配置项**：重试上限 `RETRY_MAX_RETRIES = 5`、退避参数、退避封顶，截至 1.18.21 均不可配（上游 issue <https://github.com/anomalyco/opencode/issues/43596> 已提、未实现）。
+
+master 的注入方案解决了配额场景的"等多久"，但两个问题够不到：
+
+- **次数上限**：任何可重试错误 5 次后中断。配额 429 靠注入一次长等待可绕过；但并发限流、网络错误等持续故障时，5 次 × 30s ≈ 2.5 分钟就放弃
+- **退避无封顶**：响应带 headers 但没有 retry-after 时（并发限流、网络错误类），指数退避没有封顶——实测 38.4s/76.2s 一路翻倍，理论上限 24.8 天，重试间隔失控
+
+既然上游配置不了，本分支在启动时直接等长改写 opencode 二进制里的这些常量。
+
+### 加了什么
+
+| 配置项 | 取值 | 作用 |
+|---|---|---|
+| `maxRetries` | -1（无限）或 1-99 | 重试次数上限。-1 时退避序列如 `2/4/8/16/38/76s...` 无限持续；配额场景配合 master 注入，一次重试落在限额重置后即恢复 |
+| `backoffCapMs` | 10000-999999（10s-16.6min） | 无 retry-after 头时的退避封顶：指数段照常（2/4/8/16s），超上限钉住。实测 `2.1/4.6/9.7/17.6/30.0/30.0...`。`retry-after-ms` 注入路径不经过改点，配额等待不受影响 |
+| `restore` | true | 从 `.retry-bak` 备份还原出厂二进制 |
+
+组合约束（等长替换的位预算）：`backoffCapMs` ≥ 100000（6 位数）时 `maxRetries` 仅支持 -1 或 1-9。入口校验范围与组合，无效配置 toast 提示且不碰二进制。
+
+### 如何使用
+
+两步：
+
+1. `opencode.jsonc` 插件指向本分支（同步机制感知 spec 里的分支，保持默认开启即可）：
+
+```jsonc
+"plugin": [
+  "opencode-quota-retry@git+https://github.com/yangyaofei/opencode-quota-retry.git#patch-max-retries"
+]
+```
+
+2. `quota-retry.jsonc` 加 `patch` 段：
 
 ```jsonc
 {
+  "providers": [ /* 同 master，配额注入配置不变 */ ],
   "patch": {
     "enabled": true,
-    "maxRetries": -1,        // -1 = 无限重试; 或 1-999 指定次数
-    "backoffCapMs": 30000    // 可选: 指数退避封顶 (10000-999999, 即 10s-16.6min)
+    "maxRetries": -1,        // -1 无限 | 1-99 指定次数
+    "backoffCapMs": 30000    // 可选: 指数退避封顶
   }
 }
 ```
 
-`backoffCapMs` 针对无 `retry-after` 头的重试（并发限流、网络错误类）：指数段照常（2/4/8/16s），超过上限后钉住。实测序列 `2.1/4.6/9.7/17.6/30.0/30.0/30.0...`（未打补丁时该分支无封顶，实测 38.4s/76.2s 一路翻倍到 24.8 天）。`retry-after-ms` 注入路径不经过此改点，配额等待值不受影响。
+如需还原：`"patch": { "enabled": false, "restore": true }` 改完重启一次。
 
-约束：等长替换的位预算有限——`backoffCapMs`（6 位数，即 ≥100s）与 `maxRetries`（2 位数，即 ≥10）不能同时设置；`maxRetries` 有效范围 -1 或 1-99；插件在启动入口做范围与组合校验，无效配置 toast 提示且不动二进制。
+### 如何生效
 
-启动开销与幂等：
+- opencode 是 bun 单二进制，内嵌 JS 明文。插件按 `=2147483647,`（绝对上限常量）锚定重试常量链 `,TH=30000,DH=2147483647,RV=5` 与上限判定点 `attempt>RV)`，做**等长替换**（字节数不变，Bun 模块偏移表不受影响）：
+  - `maxRetries: -1` → 判定式改为恒假的 `attempt<-1)`
+  - `maxRetries: N` → 链中数值改为 N，位数增减从相邻常量吸收
+  - `backoffCapMs` → 改 TH 值 + 把无 retry-after 分支落到函数尾现成的 `Math.min(退避, TH)` 封顶式
+- 改的是磁盘二进制，**下次启动生效**（正在运行的进程不受影响）；写入走临时文件 + rename（规避运行中二进制 ETXTBSY）
+- 处理所有平台变体二进制（`opencode.exe`、`opencode-linux-x64`、`opencode-linux-x64-baseline` 等自动发现）
+- npm 升级 opencode 覆盖二进制后，下次启动自动重打；找不到常量链（版本大改）则跳过并 toast，不做任何修改
+- macOS：改字节会使代码签名失效（arm64 进程会被内核终止），写入后自动 `codesign -f -s -` 重签名，失败 toast 提示手动命令
 
-- 补丁读写量大（3×184MB），通过 `setImmediate` 延迟到事件循环空闲执行，不阻塞 opencode 启动
-- 状态缓存 `~/.cache/opencode/quota-retry-patch-state.json` 记录每份二进制的 size + mtime + 已应用目标；启动时 `stat` 命中即跳过（不读盘、不写入、不 toast）
-- npm 升级换文件 / 修改配置 → stat 或目标变化 → 自动失效重做；npm 卸载平台包 → 状态条目自动清理
-- 状态文件损坏按空处理（下次启动重打一遍，幂等无副作用）
+### 启动开销与幂等
 
-启用方式（分支安装，`opencode.jsonc`）：
-
-```jsonc
-"opencode-quota-retry@git+https://github.com/yangyaofei/opencode-quota-retry.git#patch-max-retries"
-```
-
-同步机制感知安装 spec 里的分支：分支推了新 commit 会自动跟进（删除重装），无需关闭 `syncEnabled`；master 安装（无 `#`）行为不变。
-
-已实测（opencode 1.18.19，三份二进制）：`-1` + `backoffCapMs: 30000` 组合下退避序列 `2.1/4.6/9.7/17.6/30.0/30.0...` 且无限重试；`9` 与 `99` 模式正确改写常量链（`yh=9` / `dh=999999999,yh=99`，退避封顶值 30s 全程保全）；`restore` 完整还原；分支安装连续启动无误删。
-
-- `-1`：把上限判定 `attempt > 5` 等长改写为恒假的 `attempt < -1`，无限重试
-- `1-999`：改常量链里的数值；位数增减从相邻的无 headers 封顶值（30000）伸缩补偿，文件总长度不变
-- 还原：`{"patch": {"enabled": false, "restore": true}}` 从 `.retry-bak` 备份恢复
-
-机制说明：
-
-- opencode 是 bun 单二进制，内嵌 JS 明文；插件按 `=2147483647,`（max delay 常量）锚定重试常量链 `,TH=30000,DH=2147483647,RV=5`，等长替换
-- 正在运行的二进制直接写会报 ETXTBSY，走临时文件 + rename 覆盖；改动在下次启动生效
-- 同时处理所有平台变体二进制（`opencode-linux-x64`、`opencode-linux-x64-baseline` 等）
-- 找不到常量链（opencode 版本大改）时跳过并 toast 提示，不做任何修改
-- 注意：npm 升级 opencode 后二进制被覆盖，下次启动插件会自动重打
-- macOS：修改字节会使代码签名失效（arm64 上进程会被内核直接终止），插件写入后自动执行 `codesign -f -s -` 重新 ad-hoc 签名；签名失败会 toast 提示手动命令
-- 本分支若经 git URL 安装，请同时设 `"syncEnabled": false`（自同步按 master 比对，会删掉分支版本）
+- 补丁读写量大（3×184MB），经 `setImmediate` 延迟到事件循环空闲执行，不阻塞 opencode 启动
+- 状态缓存 `~/.cache/opencode/quota-retry-patch-state.json` 记每份二进制的 size + mtime + 已应用目标；启动时 `stat` 命中即跳过（不读盘、不写入、不 toast），稳态启动零开销
+- 升级换文件 / 修改配置 → stat 或目标变化 → 自动重做；每个补丁点有独立的已打检测 + 写前逐点字节校验，不会重复打
+- 首次写入前备份 `.retry-bak`（始终为出厂态）；状态文件损坏按空处理，重打一遍无副作用
 
 ## 限制
 
 - master 分支（无补丁）下重试次数上限 5 次够不到；本分支可用 `patch` 修改。相关上游 issue：<https://github.com/anomalyco/opencode/issues/43596>
+- 补丁基于 1.18.19 二进制布局实测；上游若合并 #43596 或重构 retry.ts，常量链匹配不到时自动停打并 toast
 - 标题生成的重试不走这条路径，标题失败不影响正文
 - 未配置的 provider 不受影响
