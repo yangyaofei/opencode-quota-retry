@@ -541,9 +541,14 @@ function writePatched(bin: string, buf: Buffer, edits: Array<{ at: number; from:
   const bak = `${bin}.retry-bak`
   if (!existsSync(bak)) copyFileSync(bin, bak)
   const tmp = `${bin}.retry-patch-tmp`
-  writeFileSync(tmp, buf)
-  chmodSync(tmp, 0o755)
-  renameSync(tmp, bin)
+  try {
+    writeFileSync(tmp, buf)
+    chmodSync(tmp, 0o755)
+    renameSync(tmp, bin)
+  } catch (e) {
+    rmSync(tmp, { force: true }) // 失败不留残片(曾因 ENOSPC 留下半写文件占满磁盘)
+    throw e
+  }
   if (!codesignAdHoc(bin)) throw new Error("codesign failed (macOS)")
 }
 
@@ -551,9 +556,14 @@ function restoreBinary(bin: string): boolean {
   const bak = `${bin}.retry-bak`
   if (!existsSync(bak)) return false
   const tmp = `${bin}.retry-restore-tmp`
-  copyFileSync(bak, tmp)
-  chmodSync(tmp, 0o755)
-  renameSync(tmp, bin)
+  try {
+    copyFileSync(bak, tmp)
+    chmodSync(tmp, 0o755)
+    renameSync(tmp, bin)
+  } catch (e) {
+    rmSync(tmp, { force: true })
+    throw e
+  }
   codesignAdHoc(bin)
   return true
 }
