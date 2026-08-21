@@ -113,7 +113,9 @@ opencode 检测到缓存缺失会自动重新安装最新版（同步删除后�
 "opencode-quota-retry@git+https://github.com/yangyaofei/opencode-quota-retry.git#patch-max-retries"
 ```
 
-同时在 `quota-retry.jsonc` 里设 `"syncEnabled": false`。已实测（opencode 1.18.19，三份二进制）：`-1` 模式下主 stream 第 7 次尝试正常出现（2.2/4.3/8.9/17.8/38.4/76.2s 纯指数增长，原生 5 次上限会在第 6 次后中断）；`9` 与 `99` 模式正确改写常量链（`yh=9` / `th=3000,yh=99`）；`restore` 完整还原。
+同步机制感知安装 spec 里的分支：分支推了新 commit 会自动跟进（删除重装），无需关闭 `syncEnabled`；master 安装（无 `#`）行为不变。
+
+已实测（opencode 1.18.19，三份二进制）：`-1` 模式下主 stream 第 7 次尝试正常出现（2.2/4.3/8.9/17.8/38.4/76.2s 纯指数增长，原生 5 次上限会在第 6 次后中断）；`9` 与 `99` 模式正确改写常量链（`yh=9` / `th=3000,yh=99`）；`restore` 完整还原；分支安装连续启动无误删。
 
 - `-1`：把上限判定 `attempt > 5` 等长改写为恒假的 `attempt < -1`，无限重试
 - `1-999`：改常量链里的数值；位数增减从相邻的无 headers 封顶值（30000）伸缩补偿，文件总长度不变
