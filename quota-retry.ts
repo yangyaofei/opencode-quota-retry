@@ -967,4 +967,7 @@ export default async function (input: { directory?: string; client?: any }) {
   }
 }
 
-export { patchStatusReport }
+// 注意: opencode 把模块里任何"函数型导出"都当作插件候选逐一调用。
+// 测试用的内部函数必须挂在对象下导出(非函数), 否则插件加载直接失败
+// (曾因 export { patchStatusReport } 导致 "paths[0] must be string, got object")
+export const __internals = { patchStatusReport }
