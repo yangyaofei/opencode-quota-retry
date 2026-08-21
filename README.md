@@ -126,6 +126,7 @@ opencode 检测到缓存缺失会自动重新安装最新版（同步删除后�
 - 同时处理所有平台变体二进制（`opencode-linux-x64`、`opencode-linux-x64-baseline` 等）
 - 找不到常量链（opencode 版本大改）时跳过并 toast 提示，不做任何修改
 - 注意：npm 升级 opencode 后二进制被覆盖，下次启动插件会自动重打
+- macOS：修改字节会使代码签名失效（arm64 上进程会被内核直接终止），插件写入后自动执行 `codesign -f -s -` 重新 ad-hoc 签名；签名失败会 toast 提示手动命令
 - 本分支若经 git URL 安装，请同时设 `"syncEnabled": false`（自同步按 master 比对，会删掉分支版本）
 
 ## 限制

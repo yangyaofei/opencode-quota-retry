@@ -34,7 +34,7 @@
 //   - 非 429 响应原样透传
 //   - 配额 API 只在"确认配额耗尽"的 429 时才调用, 且有 cache 兜底
 
-import { execFile } from "node:child_process"
+import { execFile, execFileSync } from "node:child_process"
 import {
   chmodSync,
   copyFileSync,
@@ -402,6 +402,18 @@ function patchBinary(bin: string, want: number): "patched" | "already" | "notfou
   return "patched"
 }
 
+// macOS 要求二进制有代码签名(至少 ad-hoc); 修改字节后签名失效,
+// arm64 上内核会直接 SIGKILL。改完必须重签(/usr/bin/codesign 系统自带, 无需证书)
+function codesignAdHoc(bin: string): boolean {
+  if (process.platform !== "darwin") return true
+  try {
+    execFileSync("codesign", ["-f", "-s", "-", bin], { stdio: "ignore", timeout: 60_000 })
+    return true
+  } catch {
+    return false
+  }
+}
+
 function writePatched(bin: string, buf: Buffer, edits: Array<{ at: number; from: string; to: string }>) {
   for (const e of edits) {
     if (buf.slice(e.at, e.at + e.from.length).toString("latin1") !== e.from) throw new Error(`patch verify fail at ${e.at}`)
@@ -413,6 +425,7 @@ function writePatched(bin: string, buf: Buffer, edits: Array<{ at: number; from:
   writeFileSync(tmp, buf)
   chmodSync(tmp, 0o755)
   renameSync(tmp, bin)
+  if (!codesignAdHoc(bin)) throw new Error("codesign failed (macOS)")
 }
 
 function restoreBinary(bin: string): boolean {
@@ -422,6 +435,7 @@ function restoreBinary(bin: string): boolean {
   copyFileSync(bak, tmp)
   chmodSync(tmp, 0o755)
   renameSync(tmp, bin)
+  codesignAdHoc(bin)
   return true
 }
 
@@ -449,7 +463,10 @@ function runPatch(cfg: PatchConfig, notify: (title: string, message: string, var
       else if (r === "unlimited-conflict") notify("quota-retry 补丁", `当前为无限补丁, 改指定次数请先 restore (${path.basename(bin)})`, "warning")
       else notify("quota-retry 补丁", `未找到重试常量链, opencode 版本可能已大改, 跳过 (${path.basename(bin)})`, "warning")
     } catch (e) {
-      notify("quota-retry 补丁", `写入失败: ${(e as Error).message} (${path.basename(bin)})`, "warning")
+      const msg = (e as Error).message.includes("codesign")
+        ? `补丁已写入但重签名失败, macOS 下可能无法启动, 请手动执行 codesign -f -s -`
+        : `写入失败: ${(e as Error).message}`
+      notify("quota-retry 补丁", `${msg} (${path.basename(bin)})`, "warning")
     }
   }
 }
