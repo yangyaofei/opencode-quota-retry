@@ -310,14 +310,16 @@ async function syncPlugin(repo: string, notify: (title: string, message: string)
 
 function opencodeBinaries(): string[] {
   const out = new Set<string>()
-  try {
-    out.add(process.execPath)
-  } catch {}
-  // execPath 形如 <pkg>/bin/opencode(.exe) 或 <pkg>/node_modules/opencode-<platform>/bin/opencode
+  // execPath 形如 <pkg>/bin/opencode(.exe) 或 <pkg>/node_modules/opencode-<platform>/bin/opencode。
+  // 只认名字是 opencode 的可执行文件: 插件被非 opencode 进程加载时(如测试 harness 的 node),
+  // execPath=node, 不能把它当补丁目标, 否则状态清理会误删全部记录
+  const exec = process.execPath
+  const execBase = path.basename(exec)
+  if (execBase === "opencode" || execBase === "opencode.exe") out.add(exec)
   // 平台包在 <pkg>/node_modules/ 下, 从两层候选根各自 glob 一遍
   for (const root of [
-    path.dirname(path.dirname(process.execPath)), // <pkg>
-    path.dirname(path.dirname(path.dirname(process.execPath))), // <pkg> 的上级(含 <pkg> 自身)
+    path.dirname(path.dirname(exec)), // <pkg>
+    path.dirname(path.dirname(path.dirname(exec))), // <pkg> 的上级(含 <pkg> 自身)
   ]) {
     try {
       for (const dir of readdirSync(path.join(root, "node_modules"))) {
@@ -610,16 +612,9 @@ function runPatch(cfg: PatchConfig, notify: (title: string, message: string, var
 
   // 入口校验: 范围 + 等长替换位预算组合, 无效即 toast 并整体跳过
   if (!restore) {
-    if (maxRetries !== -1 && !(Number.isInteger(maxRetries) && maxRetries >= 1 && maxRetries <= 99)) {
-      notify("quota-retry 补丁", "maxRetries 仅支持 -1(无限) 或 1-99", "warning")
-      return
-    }
-    if (cap !== undefined && !(Number.isInteger(cap) && cap >= 10_000 && cap <= 999_999)) {
-      notify("quota-retry 补丁", "backoffCapMs 仅支持 10000-999999 (10s 到 16.6 分钟)", "warning")
-      return
-    }
-    if (cap !== undefined && cap >= 100_000 && maxRetries >= 10 && maxRetries !== -1) {
-      notify("quota-retry 补丁", "backoffCapMs ≥ 100s(6 位数)时 maxRetries 仅支持 -1 或 1-9 (等长替换位预算)", "warning")
+    const v = validatePatchConfig(cfg)
+    if (!v.ok) {
+      notify("quota-retry 补丁", v.reason!, "warning")
       return
     }
   }
@@ -672,14 +667,165 @@ function runPatch(cfg: PatchConfig, notify: (title: string, message: string, var
       changed = true
     }
   }
-  // 清理已消失的二进制(如 npm 卸载平台包)
-  for (const k of Object.keys(state)) {
-    if (!bins.includes(k)) {
-      delete state[k]
-      changed = true
+  // 清理已消失的二进制(如 npm 卸载平台包); 一份都没探测到时不清理
+  // (非 opencode 进程加载本插件时 bins 为空, 此时清空状态 = 误删)
+  if (bins.length > 0) {
+    for (const k of Object.keys(state)) {
+      if (!bins.includes(k)) {
+        delete state[k]
+        changed = true
+      }
     }
   }
   if (changed) savePatchState(state)
+}
+
+// ===== /retry-setting 状态查询 =====
+
+// 入口校验(runPatch 与状态报告共用): 范围 + 等长替换位预算组合
+function validatePatchConfig(cfg: PatchConfig): { ok: boolean; reason?: string } {
+  if (cfg.restore === true) return { ok: true }
+  const maxRetries = cfg.maxRetries ?? -1
+  const cap = cfg.backoffCapMs
+  if (maxRetries !== -1 && !(Number.isInteger(maxRetries) && maxRetries >= 1 && maxRetries <= 99)) {
+    return { ok: false, reason: "maxRetries 仅支持 -1(无限) 或 1-99" }
+  }
+  if (cap !== undefined && !(Number.isInteger(cap) && cap >= 10_000 && cap <= 999_999)) {
+    return { ok: false, reason: "backoffCapMs 仅支持 10000-999999 (10s 到 16.6 分钟)" }
+  }
+  if (cap !== undefined && cap >= 100_000 && maxRetries >= 10 && maxRetries !== -1) {
+    return { ok: false, reason: "backoffCapMs ≥ 100s(6 位数)时 maxRetries 仅支持 -1 或 1-9 (等长替换位预算)" }
+  }
+  return { ok: true }
+}
+
+// 实际生效的配置文件路径(项目 .opencode/ 优先于全局)
+function findConfigFile(projectDir: string): string {
+  const candidates = [path.join(projectDir, ".opencode", "quota-retry.jsonc"), globalConfigPath()]
+  for (const f of candidates) if (existsSync(f)) return f
+  return globalConfigPath()
+}
+
+function describePatchConfig(patch: PatchConfig): string {
+  const parts = [`enabled=${patch.enabled ?? false}`]
+  if (patch.maxRetries !== undefined) parts.push(`maxRetries=${patch.maxRetries}${patch.maxRetries === -1 ? "(无限)" : ""}`)
+  if (patch.backoffCapMs !== undefined) parts.push(`backoffCapMs=${patch.backoffCapMs}`)
+  if (patch.restore !== undefined) parts.push(`restore=${patch.restore}`)
+  return parts.join(" | ")
+}
+
+// 只读对照报告: 配置期望 vs 二进制实际(不写盘, 不 toast, 不触发同步)。
+// bins 参数供脱离 opencode 进程的测试注入; 缺省自动探测
+function patchStatusReport(projectDir: string, binsOverride?: string[]): string {
+  const lines: string[] = []
+  const cfg = loadConfig(projectDir)
+  const patch = cfg.patch ?? {}
+  lines.push(`配置文件: ${findConfigFile(projectDir)}`)
+
+  if (cfg.providers?.length) {
+    lines.push("providers(429 拦截):")
+    for (const p of cfg.providers) {
+      if (!p?.id) continue
+      const parts = [p.id, `配额判定=${p.quota}`]
+      parts.push(p.quotaMatch ? "quotaMatch=自定义" : "quotaMatch=内置默认")
+      parts.push(p.resetExtract ? "resetExtract=自定义" : "resetExtract=内置默认")
+      parts.push(`fallbackWaitMs=${p.fallbackWaitMs ?? DEFAULT_FALLBACK_WAIT_MS}`)
+      parts.push(`bufferMs=${p.bufferMs ?? DEFAULT_BUFFER_MS}`)
+      lines.push(`  - ${parts.join(", ")}`)
+    }
+  } else {
+    lines.push("providers(429 拦截): 未配置")
+  }
+
+  const enabled = patch.enabled === true || patch.restore === true
+  lines.push(`patch 配置: ${enabled ? describePatchConfig(patch) : "未启用"}`)
+  let active = false
+  if (!enabled) {
+    lines.push("  patch.enabled 未开启: 启动时不检查也不改动二进制, 以下为当前实际状态")
+  } else {
+    const v = validatePatchConfig(patch)
+    active = v.ok
+    lines.push(`入口校验: ${v.ok ? "通过" : `未通过 — ${v.reason} (启动时补丁整体跳过)`}`)
+  }
+
+  const bins = binsOverride ?? opencodeBinaries()
+  const state = loadPatchState()
+  if (bins.length === 0) lines.push("opencode 二进制: 未找到(当前进程不是 opencode)")
+  bins.forEach((bin, i) => {
+    lines.push(`二进制 ${i + 1}/${bins.length}: ${bin}`)
+    let buf: Buffer
+    try {
+      buf = readFileSync(bin)
+    } catch (e) {
+      lines.push(`  读取失败: ${(e as Error).message}`)
+      return
+    }
+    const chain = findRetryChain(buf)
+    if (!chain) {
+      lines.push("  未找到重试常量链(opencode 版本可能已大改)")
+      return
+    }
+    const cur = chain.span.match(CHAIN_VALS_RE)
+    if (!cur) {
+      lines.push("  常量链结构无法解析")
+      return
+    }
+    const actual = {
+      unlimited: hasUnlimitedPatch(buf),
+      yh: Number(cur[2]),
+      th: Number(cur[1]),
+      cap: hasBackoffCap(buf, chain),
+    }
+    // 出厂基线: 新鲜备份(等长补丁 size 恒不变, size 相同才可信) > 无补丁标记的当前链 > 未知
+    const bak = `${bin}.retry-bak`
+    let factory: { th: number; yh: number } | undefined
+    let bakNote = ""
+    if (existsSync(bak)) {
+      if (statSync(bak).size === statSync(bin).size) {
+        const bv = findRetryChain(readFileSync(bak))?.span.match(CHAIN_VALS_RE)
+        if (bv) factory = { th: Number(bv[1]), yh: Number(bv[2]) }
+      } else {
+        bakNote = "备份与当前二进制版本不一致(跨版本旧备份)"
+        if (!actual.unlimited && !actual.cap) factory = { th: actual.th, yh: actual.yh }
+      }
+    } else if (!actual.unlimited && !actual.cap) {
+      factory = { th: actual.th, yh: actual.yh }
+    }
+
+    // 配置期望(四轴): restore 优先, 其次显式配置, 未配置的轴 = 出厂值
+    const want = active
+      ? {
+          unlimited: patch.restore === true ? false : (patch.maxRetries ?? -1) === -1,
+          cap: patch.restore === true ? false : patch.backoffCapMs !== undefined,
+          th: patch.restore === true || patch.backoffCapMs === undefined ? factory?.th : patch.backoffCapMs,
+          yh: patch.restore !== true && (patch.maxRetries ?? -1) > 0 ? patch.maxRetries : factory?.yh,
+        }
+      : undefined
+
+    const cmp = (label: string, a: string, w: string | undefined) => {
+      if (!active || w === undefined) lines.push(`  ${label}: ${a}`)
+      else if (a === w) lines.push(`  ${label}: ${a} — 与配置一致`)
+      else lines.push(`  ${label}: 实际=${a}, 配置期望=${w} — 未写入(下次启动自动改写)`)
+    }
+    cmp(
+      "无限重试",
+      actual.unlimited ? "已开启" : "未开启",
+      want ? (want.unlimited ? "已开启" : "未开启") : undefined,
+    )
+    cmp("次数上限", `${actual.yh} 次`, want?.yh !== undefined ? `${want.yh} 次` : undefined)
+    cmp("退避封顶", actual.cap ? `${actual.th}ms` : `未开启(指数退避无上限, 绝对上限 ${actual.th}ms)`, want ? (want.cap ? `${want.th}ms` : "未开启") : undefined)
+
+    const rec = state[bin]
+    const st = binStat(bin)
+    if (rec) {
+      const hit = st && rec.size === st.size && rec.mtimeMs === st.mtimeMs
+      lines.push(`  状态缓存: ${rec.want}${hit ? " (stat 命中, 下次启动跳过检查)" : " (stat 已变化, 下次启动重新检查)"}`)
+    } else {
+      lines.push("  状态缓存: 无记录(下次启动全量检查)")
+    }
+    if (bakNote) lines.push(`  备份: ${bakNote}${factory ? ", 当前无补丁标记, 以当前链为出厂基线" : ", 且当前带补丁标记, 下次启动按 conflict 处理"}`)
+  })
+  return lines.join("\n")
 }
 
 // 从 429 body 提取重置时刻(捕获组 1 = 完整时间串); 无时区后缀按 +08:00 解析。
@@ -692,7 +838,8 @@ function parseExtractedTime(m: RegExpMatchArray | null): number {
 }
 
 export default async function (input: { directory?: string; client?: any }) {
-  const pluginConfig = loadConfig(input.directory ?? process.cwd())
+  const projectDir = input.directory ?? process.cwd()
+  const pluginConfig = loadConfig(projectDir)
   const toastClient = input.client
   const toast = (title: string, message: string, variant: "info" | "warning" = "info") => {
     try {
@@ -792,6 +939,13 @@ export default async function (input: { directory?: string; client?: any }) {
 
   return {
     config: (cfg: any) => {
+      // /retry-setting 命令: 模板只做呈现, 读数归 quota_retry_status 工具(确定性工作不过模型)
+      cfg.command = cfg.command ?? {}
+      cfg.command["retry-setting"] = {
+        description: "查看 quota-retry 重试配置与二进制补丁的实际生效状态",
+        template:
+          "调用 quota_retry_status 工具获取状态报告, 将其输出完整原样呈现给用户(保留所有小节与对照结论)。不要省略, 不要改写数字, 不要自行推测。",
+      }
       if (!pluginConfig.providers || pluginConfig.providers.length === 0) return
       cfg.provider = cfg.provider ?? {}
       for (const p of pluginConfig.providers) {
@@ -803,5 +957,14 @@ export default async function (input: { directory?: string; client?: any }) {
         }
       }
     },
+    tool: {
+      quota_retry_status: {
+        description:
+          "读取 quota-retry 配置(项目 .opencode/ 覆盖全局)、入口校验结果、每份 opencode 二进制重试参数的实际值(无限重试/次数上限/退避封顶), 输出配置期望与二进制实际的对照报告, 标出哪些值已写入、哪些未写入。只读, 无副作用。",
+        execute: async () => patchStatusReport(projectDir),
+      },
+    },
   }
 }
+
+export { patchStatusReport }
