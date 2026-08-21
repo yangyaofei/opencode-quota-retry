@@ -295,16 +295,22 @@ function opencodeBinaries(): string[] {
   try {
     out.add(process.execPath)
   } catch {}
-  try {
-    const nm = path.dirname(path.dirname(path.dirname(process.execPath)))
-    for (const dir of readdirSync(nm)) {
-      if (!dir.startsWith("opencode-")) continue
-      for (const name of ["opencode", "opencode.exe"]) {
-        const bin = path.join(nm, dir, "bin", name)
-        if (existsSync(bin)) out.add(bin)
+  // execPath 形如 <pkg>/bin/opencode(.exe) 或 <pkg>/node_modules/opencode-<platform>/bin/opencode
+  // 平台包在 <pkg>/node_modules/ 下, 从两层候选根各自 glob 一遍
+  for (const root of [
+    path.dirname(path.dirname(process.execPath)), // <pkg>
+    path.dirname(path.dirname(path.dirname(process.execPath))), // <pkg> 的上级(含 <pkg> 自身)
+  ]) {
+    try {
+      for (const dir of readdirSync(path.join(root, "node_modules"))) {
+        if (!dir.startsWith("opencode-")) continue
+        for (const name of ["opencode", "opencode.exe"]) {
+          const bin = path.join(root, "node_modules", dir, "bin", name)
+          if (existsSync(bin)) out.add(bin)
+        }
       }
-    }
-  } catch {}
+    } catch {}
+  }
   return [...out]
 }
 
@@ -320,16 +326,20 @@ const MAX_DELAY_ANCHOR = "=2147483647,"
 function findRetryChain(buf: Buffer): RetryChain | undefined {
   let idx = buf.indexOf(MAX_DELAY_ANCHOR)
   while (idx !== -1) {
-    const after = buf.slice(idx + MAX_DELAY_ANCHOR.length, idx + MAX_DELAY_ANCHOR.length + 24).toString("latin1")
+    const after = buf
+      .slice(idx + MAX_DELAY_ANCHOR.length, idx + MAX_DELAY_ANCHOR.length + 24)
+      .toString("latin1")
+    // 锚点后紧跟: RV=NUM,
     const m = after.match(/^([A-Za-z_$][\w$]{0,2})=(\d{1,3}),/)
     if (m) {
-      const before = buf.slice(Math.max(0, idx - 40), idx).toString("latin1")
-      const mb = before.match(/,([A-Za-z_$][\w$]{0,2})=(\d{2,6}),[A-Za-z_$][\w$]{0,2}=$/)
+      // 锚点前(不含锚点的'='): ,TH=NUM,DH  —— 切片止于 DH 变量名, 无 '='
+      const beforeStart = Math.max(0, idx - 40)
+      const before = buf.slice(beforeStart, idx).toString("latin1")
+      const mb = before.match(/,([A-Za-z_$][\w$]{0,2})=(\d{2,6}),([A-Za-z_$][\w$]{0,2})$/)
       if (mb) {
-        const spanStart = idx - mb[0].length
-        const span = buf
-          .slice(spanStart, idx + MAX_DELAY_ANCHOR.length + m[0].length)
-          .toString("latin1")
+        const spanStart = beforeStart + mb.index!
+        const spanEnd = idx + MAX_DELAY_ANCHOR.length + m[0].length - 1 // 去掉尾逗号
+        const span = buf.slice(spanStart, spanEnd).toString("latin1")
         return { spanStart, span, retryVar: m[1], retryVal: m[2] }
       }
     }
